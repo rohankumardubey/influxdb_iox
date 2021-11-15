@@ -57,6 +57,12 @@ pub enum Error {
 
     #[snafu(display("Cannot drop unpersisted chunk: {}", addr))]
     CannotDropUnpersistedChunk { addr: ChunkAddr },
+
+    #[snafu(display("No chunks provided"))]
+    EmptyChunks {},
+
+    #[snafu(display("Chunks not belong to the partition"))]
+    ChunksNotInPartition {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -912,6 +912,7 @@ mod tests {
         fn compact_object_store_chunks(
             partition: LifecycleWriteGuard<'_, TestPartition, Self>,
             chunks: Vec<LifecycleWriteGuard<'_, TestChunk, Self::Chunk>>,
+            _handle: Self::PersistHandle,
         ) -> Result<TaskTracker<()>, Self::Error> {
             // todo
 
