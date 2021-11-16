@@ -1,3 +1,5 @@
+---
+
 # CI Overview
 # -----------
 #
@@ -58,6 +60,33 @@ commands:
           paths:
             - /usr/local/cargo/registry
           key: cargo-cache-{{ arch }}-{{ .Branch }}-{{ checksum "Cargo.lock" }}
+
+
+template_test: &template_test
+  environment:
+    # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
+    CARGO_INCREMENTAL: "0"
+    # Disable full debug symbol generation to speed up CI build
+    # "1" means line tables only, which is useful for panic tracebacks.
+    RUSTFLAGS: "-C debuginfo=1"
+    RUST_BACKTRACE: "1"
+    # Run integration tests
+    TEST_INTEGRATION: 1
+    INFLUXDB_IOX_INTEGRATION_LOCAL: 1
+    KAFKA_CONNECT: "localhost:9092"
+  steps:
+    - run:
+        name: Run Kafka
+        # Sudo needed because data directory owned by root but container runs as unprivileged user
+        command: sudo rpk redpanda start
+        background: true
+    - checkout
+    - rust_components
+    - cache_restore
+    - run:
+        name: Cargo test
+        command: cargo test --workspace
+    - cache_save
 
 jobs:
   fmt:
@@ -138,34 +167,17 @@ jobs:
       - store_artifacts:
           path: rustdoc.tar.gz
 
-  test:
+  test_x64:
+    <<: *template_test
     docker:
       - image: quay.io/influxdb/rust:ci
     resource_class: xlarge # use of a smaller executor tends crashes on link
-    environment:
-      # Disable incremental compilation to avoid overhead. We are not preserving these files anyway.
-      CARGO_INCREMENTAL: "0"
-      # Disable full debug symbol generation to speed up CI build
-      # "1" means line tables only, which is useful for panic tracebacks.
-      RUSTFLAGS: "-C debuginfo=1"
-      RUST_BACKTRACE: "1"
-      # Run integration tests
-      TEST_INTEGRATION: 1
-      INFLUXDB_IOX_INTEGRATION_LOCAL: 1
-      KAFKA_CONNECT: "localhost:9092"
-    steps:
-      - run:
-          name: Run Kafka
-          # Sudo needed because data directory owned by root but container runs as unprivileged user
-          command: sudo rpk redpanda start
-          background: true
-      - checkout
-      - rust_components
-      - cache_restore
-      - run:
-          name: Cargo test
-          command: cargo test --workspace
-      - cache_save
+
+  test_arm64:
+    <<: *template_test
+    resource_class: arm.medium
+    machine:
+      image: quay.io/influxdb/rust:ci
 
   # end to end tests with Heappy (heap profiling enabled)
   test_heappy:
@@ -405,7 +417,8 @@ workflows:
       - lint
       - cargo_audit
       - protobuf-lint
-      - test
+      - test_x64
+      - test_arm64
       - test_heappy
       - test_perf
       - build
@@ -419,7 +432,8 @@ workflows:
             - lint
             - cargo_audit
             - protobuf-lint
-            - test
+            - test_x64
+            - test_arm64
             - test_heappy
             - test_perf
             - build
