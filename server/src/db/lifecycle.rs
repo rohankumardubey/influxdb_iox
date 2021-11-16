@@ -208,7 +208,8 @@ impl LockablePartition for LockableCatalogPartition {
     ) -> Result<TaskTracker<Job>, Self::Error> {
         info!(table=%partition.table_name(), partition=%partition.partition_key(), "compacting object store chunks");
         let (tracker, fut) = persist::compact_object_store_chunks(partition, chunks, handle.0)?;
-        let _ = tokio::spawn(async move { fut.await.log_if_error("compacting object store chunks") });
+        let _ =
+            tokio::spawn(async move { fut.await.log_if_error("compacting object store chunks") });
         Ok(tracker)
     }
 

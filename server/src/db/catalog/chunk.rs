@@ -736,10 +736,18 @@ impl CatalogChunk {
     pub fn set_compacting_object_store(&mut self, registration: &TaskRegistration) -> Result<()> {
         match &self.stage {
             ChunkStage::Open { .. } | ChunkStage::Frozen { .. } => {
-                unexpected_state!(self, "setting compacting object store", "Persisted", &self.stage)
+                unexpected_state!(
+                    self,
+                    "setting compacting object store",
+                    "Persisted",
+                    &self.stage
+                )
             }
             ChunkStage::Persisted { .. } => {
-                self.set_lifecycle_action(ChunkLifecycleAction::CompactingObjectStore, registration)?;
+                self.set_lifecycle_action(
+                    ChunkLifecycleAction::CompactingObjectStore,
+                    registration,
+                )?;
                 Ok(())
             }
         }

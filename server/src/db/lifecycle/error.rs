@@ -58,11 +58,16 @@ pub enum Error {
     #[snafu(display("Cannot drop unpersisted chunk: {}", addr))]
     CannotDropUnpersistedChunk { addr: ChunkAddr },
 
-    #[snafu(display("No chunks provided"))]
+    #[snafu(display("No object store chunks provided for compacting"))]
     EmptyChunks {},
 
-    #[snafu(display("Chunks not belong to the partition"))]
+    #[snafu(display(
+        "Cannot compact chunks because at least one does not belong to the given partition"
+    ))]
     ChunksNotInPartition {},
+
+    #[snafu(display("Cannot compact the provided persisted chunks. They are not contiguous"))]
+    ChunksNotContiguous {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

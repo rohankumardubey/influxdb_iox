@@ -14,7 +14,11 @@ use persistence_windows::{
 use predicate::delete_predicate::DeletePredicate;
 use schema::Schema;
 use snafu::{OptionExt, Snafu};
-use std::{collections::{BTreeMap, BTreeSet}, fmt::Display, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    sync::Arc,
+};
 use time::{Time, TimeProvider};
 use tracker::RwLock;
 
@@ -359,7 +363,7 @@ impl Partition {
         self.chunks.values()
     }
 
-    /// Return true if there are no other persisted chunks that are in the middle of 
+    /// Return true if there are no other persisted chunks that are in the middle of
     /// the provided chunk orders
     pub fn contiguous_object_store_chunks(&self, chunk_orders: &BTreeSet<ChunkOrder>) -> bool {
         let chunks = self.chunks();
@@ -367,13 +371,14 @@ impl Partition {
             let chunk = chunk.read();
             if chunk.is_persisted() {
                 let order = chunk.order();
+                println!(" --- order: {:#?}", order);
                 // this chunk does not belong to chunk_orders but in the middle of them
                 if !chunk_orders.contains(&order) && chunk_orders.range(order..).count() > 0 {
                     return false;
                 }
             }
         }
-        return true;
+        true
     }
 
     /// Return chunks in this partition with their order and ids.

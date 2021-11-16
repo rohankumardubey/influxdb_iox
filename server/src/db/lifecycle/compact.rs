@@ -1,7 +1,11 @@
 //! This module contains the code to compact chunks together
 
 use super::{error::Result, merge_schemas, LockableCatalogChunk, LockableCatalogPartition};
-use crate::db::{DbChunk, catalog::{chunk::CatalogChunk, partition::Partition}, lifecycle::collect_rub};
+use crate::db::{
+    catalog::{chunk::CatalogChunk, partition::Partition},
+    lifecycle::collect_rub,
+    DbChunk,
+};
 use data_types::{chunk_metadata::ChunkOrder, job::Job};
 use lifecycle::LifecycleWriteGuard;
 use observability_deps::tracing::info;
@@ -332,5 +336,4 @@ mod tests {
         let expected = vec![pred3];
         assert_eq!(actual, &expected);
     }
-
 }

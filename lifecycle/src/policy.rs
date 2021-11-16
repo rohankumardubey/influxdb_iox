@@ -923,7 +923,6 @@ mod tests {
             Ok(db.registry.lock().complete(()))
         }
 
-
         fn prepare_persist(
             partition: &mut LifecycleWriteGuard<'_, Self::Partition, Self>,
             _force: bool,

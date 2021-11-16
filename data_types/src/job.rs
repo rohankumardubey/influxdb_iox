@@ -109,7 +109,9 @@ impl Job {
             Self::Dummy { .. } => "Dummy Job, for testing",
             Self::WriteChunk { .. } => "Writing chunk to Object Storage",
             Self::CompactChunks { .. } => "Compacting chunks to ReadBuffer",
-            Self::CompactObjectStoreChunks { .. } => "Compacting Object Store chunks to an Object Store chunk",
+            Self::CompactObjectStoreChunks { .. } => {
+                "Compacting Object Store chunks to an Object Store chunk"
+            }
             Self::PersistChunks { .. } => "Persisting chunks to object storage",
             Self::DropChunk { .. } => "Drop chunk from memory and (if persisted) from object store",
             Self::DropPartition { .. } => {
@@ -126,7 +128,9 @@ impl std::fmt::Display for Job {
             Job::Dummy { .. } => write!(f, "Job::Dummy"),
             Job::WriteChunk { chunk } => write!(f, "Job::WriteChunk({}))", chunk),
             Job::CompactChunks { partition, .. } => write!(f, "Job::CompactChunks({})", partition),
-            Job::CompactObjectStoreChunks { partition, .. } => write!(f, "Job::CompactObjectStoreChunks({})", partition),
+            Job::CompactObjectStoreChunks { partition, .. } => {
+                write!(f, "Job::CompactObjectStoreChunks({})", partition)
+            }
             Job::PersistChunks { partition, .. } => write!(f, "Job::PersistChunks({})", partition),
             Job::DropChunk { chunk } => write!(f, "Job::DropChunk({})", chunk),
             Job::DropPartition { partition } => write!(f, "Job::DropPartition({})", partition),
