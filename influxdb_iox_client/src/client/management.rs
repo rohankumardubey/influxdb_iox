@@ -146,9 +146,59 @@ pub enum DeleteDatabaseError {
     ServerError(tonic::Status),
 }
 
-/// Errors returned by Client::delete_database
+/// Errors returned by Client::release_database
+#[derive(Debug, Error)]
+pub enum ReleaseDatabaseError {
+    /// The UUID specified was not in a valid format
+    #[error("Invalid UUID: {0}")]
+    InvalidUuid(#[from] uuid::Error),
+
+    /// Database not found
+    #[error("Could not find database {}", .name)]
+    DatabaseNotFound {
+        /// The name specified
+        name: String,
+    },
+
+    /// Server returned an invalid argument error
+    #[error("Invalid argument {}: {}", .0.code(), .0.message())]
+    InvalidArgument(tonic::Status),
+
+    /// Server ID is not set
+    #[error("Server ID not set")]
+    NoServerId,
+
+    /// Client received an unexpected error from the server
+    #[error("Unexpected server error: {}: {}", .0.code(), .0.message())]
+    ServerError(tonic::Status),
+}
+
+/// Errors returned by Client::restore_database
 #[derive(Debug, Error)]
 pub enum RestoreDatabaseError {
+    /// Database not found
+    #[error("Could not find a database with UUID `{}`", .uuid)]
+    DatabaseNotFound {
+        /// The UUID requested
+        uuid: Uuid,
+    },
+
+    /// Server indicated that it is not (yet) available
+    #[error("Server unavailable: {}", .0.message())]
+    Unavailable(tonic::Status),
+
+    /// Server ID is not set
+    #[error("Server ID not set")]
+    NoServerId,
+
+    /// Client received an unexpected error from the server
+    #[error("Unexpected server error: {}: {}", .0.code(), .0.message())]
+    ServerError(tonic::Status),
+}
+
+/// Errors returned by Client::claim_database
+#[derive(Debug, Error)]
+pub enum ClaimDatabaseError {
     /// Database not found
     #[error("Could not find a database with UUID `{}`", .uuid)]
     DatabaseNotFound {
@@ -697,6 +747,40 @@ impl Client {
         Ok(uuid)
     }
 
+    /// Release database
+    pub async fn release_database(
+        &mut self,
+        db_name: impl Into<String> + Send,
+        uuid: Option<Uuid>,
+    ) -> Result<Uuid, ReleaseDatabaseError> {
+        let db_name = db_name.into();
+        let response = self
+            .inner
+            .release_database(ReleaseDatabaseRequest {
+                db_name: db_name.clone(),
+                uuid: uuid.map(|u| u.as_bytes().to_vec()).unwrap_or_default(),
+            })
+            .await
+            .map_err(|status| match status.code() {
+                tonic::Code::NotFound => ReleaseDatabaseError::DatabaseNotFound { name: db_name },
+                tonic::Code::FailedPrecondition => ReleaseDatabaseError::NoServerId,
+                tonic::Code::InvalidArgument => ReleaseDatabaseError::InvalidArgument(status),
+                _ => ReleaseDatabaseError::ServerError(status),
+            })?;
+
+        let server_uuid = response.into_inner().uuid;
+        let uuid = Uuid::from_slice(&server_uuid)
+            .map_err(|e| {
+                format!(
+                    "Could not create UUID from server value {:?}: {}",
+                    server_uuid, e
+                )
+            })
+            .unwrap();
+
+        Ok(uuid)
+    }
+
     /// Restore database
     pub async fn restore_database(&mut self, uuid: Uuid) -> Result<(), RestoreDatabaseError> {
         self.inner
@@ -712,6 +796,22 @@ impl Client {
             })?;
 
         Ok(())
+    }
+
+    /// Claim database
+    pub async fn claim_database(&mut self, uuid: Uuid) -> Result<String, ClaimDatabaseError> {
+        let uuid_bytes = uuid.as_bytes().to_vec();
+
+        self.inner
+            .claim_database(ClaimDatabaseRequest { uuid: uuid_bytes })
+            .await
+            .map(|response| response.into_inner().db_name)
+            .map_err(|status| match status.code() {
+                tonic::Code::NotFound => ClaimDatabaseError::DatabaseNotFound { uuid },
+                tonic::Code::FailedPrecondition => ClaimDatabaseError::NoServerId,
+                tonic::Code::Unavailable => ClaimDatabaseError::Unavailable(status),
+                _ => ClaimDatabaseError::ServerError(status),
+            })
     }
 
     /// List chunks in a database.

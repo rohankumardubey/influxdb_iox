@@ -3,7 +3,7 @@ use generated_types::{
     google::{AlreadyExists, FieldViolation, FieldViolationExt, NotFound},
     influxdata::iox::management::v1::{Error as ProtobufError, *},
 };
-use predicate::delete_predicate::DeletePredicate;
+use predicate::delete_predicate::parse_delete_predicate;
 use query::QueryDatabase;
 use server::{
     connection::ConnectionManager, rules::ProvidedDatabaseRules, ApplicationState, Error, Server,
@@ -85,7 +85,7 @@ where
             omit_defaults,
         } = request.into_inner();
 
-        let name = DatabaseName::new(name).field("name")?;
+        let name = DatabaseName::new(name).scope("name")?;
         let database = self
             .server
             .database(&name)
@@ -173,7 +173,7 @@ where
         &self,
         request: Request<DeleteDatabaseRequest>,
     ) -> Result<Response<DeleteDatabaseResponse>, Status> {
-        let db_name = DatabaseName::new(request.into_inner().db_name).field("db_name")?;
+        let db_name = DatabaseName::new(request.into_inner().db_name).scope("db_name")?;
 
         let uuid = self
             .server
@@ -186,12 +186,36 @@ where
         }))
     }
 
+    async fn release_database(
+        &self,
+        request: Request<ReleaseDatabaseRequest>,
+    ) -> Result<Response<ReleaseDatabaseResponse>, Status> {
+        let ReleaseDatabaseRequest { db_name, uuid } = request.into_inner();
+
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
+        let uuid = if uuid.is_empty() {
+            None
+        } else {
+            Some(Uuid::from_slice(&uuid).scope("uuid")?)
+        };
+
+        let returned_uuid = self
+            .server
+            .release_database(&db_name, uuid)
+            .await
+            .map_err(default_server_error_handler)?;
+
+        Ok(Response::new(ReleaseDatabaseResponse {
+            uuid: returned_uuid.as_bytes().to_vec(),
+        }))
+    }
+
     async fn restore_database(
         &self,
         request: Request<RestoreDatabaseRequest>,
     ) -> Result<Response<RestoreDatabaseResponse>, Status> {
         let request = request.into_inner();
-        let uuid = Uuid::from_slice(&request.uuid).field("uuid")?;
+        let uuid = Uuid::from_slice(&request.uuid).scope("uuid")?;
 
         self.server
             .restore_database(uuid)
@@ -199,6 +223,25 @@ where
             .map_err(default_server_error_handler)?;
 
         Ok(Response::new(RestoreDatabaseResponse {}))
+    }
+
+    async fn claim_database(
+        &self,
+        request: Request<ClaimDatabaseRequest>,
+    ) -> Result<Response<ClaimDatabaseResponse>, Status> {
+        let ClaimDatabaseRequest { uuid } = request.into_inner();
+
+        let uuid = Uuid::from_slice(&uuid).scope("uuid")?;
+
+        let db_name = self
+            .server
+            .claim_database(uuid)
+            .await
+            .map_err(default_server_error_handler)?;
+
+        Ok(Response::new(ClaimDatabaseResponse {
+            db_name: db_name.to_string(),
+        }))
     }
 
     async fn list_detailed_databases(
@@ -221,7 +264,7 @@ where
         &self,
         request: Request<ListChunksRequest>,
     ) -> Result<Response<ListChunksResponse>, Status> {
-        let db_name = DatabaseName::new(request.into_inner().db_name).field("db_name")?;
+        let db_name = DatabaseName::new(request.into_inner().db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -308,7 +351,7 @@ where
         request: Request<ListPartitionsRequest>,
     ) -> Result<Response<ListPartitionsResponse>, Status> {
         let ListPartitionsRequest { db_name } = request.into_inner();
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
 
         let db = self
             .server
@@ -332,7 +375,7 @@ where
             db_name,
             partition_key,
         } = request.into_inner();
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -358,7 +401,7 @@ where
             db_name,
             partition_key,
         } = request.into_inner();
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -382,7 +425,7 @@ where
             partition_key,
             table_name,
         } = request.into_inner();
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -407,9 +450,9 @@ where
         } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
 
-        let chunk_id = ChunkId::try_from(chunk_id).field("chunk_id")?;
+        let chunk_id = ChunkId::try_from(chunk_id).scope("chunk_id")?;
 
         let tracker = self
             .server
@@ -433,13 +476,13 @@ where
         } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
             .map_err(default_server_error_handler)?;
 
-        let chunk_id = ChunkId::try_from(chunk_id).field("chunk_id")?;
+        let chunk_id = ChunkId::try_from(chunk_id).scope("chunk_id")?;
 
         db.unload_read_buffer(&table_name, &partition_key, chunk_id)
             .map_err(default_db_error_handler)?;
@@ -502,7 +545,7 @@ where
         let WipePreservedCatalogRequest { db_name } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
 
         let tracker = self
             .server
@@ -528,7 +571,7 @@ where
         let SkipReplayRequest { db_name } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
 
         let database = self
             .server
@@ -554,7 +597,7 @@ where
         } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -578,7 +621,7 @@ where
         } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
@@ -604,13 +647,13 @@ where
         } = request.into_inner();
 
         // Validate that the database name is legit
-        let db_name = DatabaseName::new(db_name).field("db_name")?;
+        let db_name = DatabaseName::new(db_name).scope("db_name")?;
         let db = self
             .server
             .db(&db_name)
             .map_err(default_server_error_handler)?;
 
-        let del_predicate_result = DeletePredicate::try_new(&start_time, &stop_time, &predicate);
+        let del_predicate_result = parse_delete_predicate(&start_time, &stop_time, &predicate);
         match del_predicate_result {
             Err(_) => {
                 return Err(default_server_error_handler(Error::DeleteExpression {

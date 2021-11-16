@@ -4,6 +4,7 @@ use super::chunk::{CatalogChunk, Error as ChunkError};
 use crate::db::catalog::metrics::PartitionMetrics;
 use data_types::{
     chunk_metadata::{ChunkAddr, ChunkId, ChunkLifecycleAction, ChunkOrder, ChunkSummary},
+    delete_predicate::DeletePredicate,
     partition_metadata::{PartitionAddr, PartitionSummary},
 };
 use hashbrown::HashMap;
@@ -11,7 +12,6 @@ use observability_deps::tracing::info;
 use persistence_windows::{
     min_max_sequence::OptionalMinMaxSequence, persistence_windows::PersistenceWindows,
 };
-use predicate::delete_predicate::DeletePredicate;
 use schema::Schema;
 use snafu::{OptionExt, Snafu};
 use std::{
@@ -371,7 +371,6 @@ impl Partition {
             let chunk = chunk.read();
             if chunk.is_persisted() {
                 let order = chunk.order();
-                println!(" --- order: {:#?}", order);
                 // this chunk does not belong to chunk_orders but in the middle of them
                 if !chunk_orders.contains(&order) && chunk_orders.range(order..).count() > 0 {
                     return false;
