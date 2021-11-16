@@ -234,15 +234,11 @@ pub fn persist_chunks(
 ///
 /// The function will error if
 ///    . No chunks are provided
-///    . provided chunk(s) not belong to the provided partittion
+///    . provided chunk(s) not belong to the provided partition
 ///    . not all provided chunks are persisted
 ///    . the provided chunks are not contiguous
-///
-// Steps:
-// 1 . The chunks will be scan to deduplicate and hard delete data if needed.
-// 2 . The result will be written into a new persisted chunk.
-// 3. If the given persisted chunks have RUBs, unload those RUBs.
-// 4. Mark given chunks no longer needed to get dropped in the background later
+/// Todo: update steps here when they are finalized
+///       This is a long complicated function so document will help
 pub(crate) fn compact_object_store_chunks(
     partition: LifecycleWriteGuard<'_, Partition, LockableCatalogPartition>,
     chunks: Vec<LifecycleWriteGuard<'_, CatalogChunk, LockableCatalogChunk>>,
@@ -260,9 +256,9 @@ pub(crate) fn compact_object_store_chunks(
     let now = std::time::Instant::now();
 
     let db = Arc::clone(&partition.data().db);
-    let addr = partition.addr().clone();
+    let partition_addr = partition.addr().clone();
     let chunk_ids: Vec<_> = chunks.iter().map(|x| x.id()).collect();
-    info!(%addr, ?chunk_ids, "compacting object store chunks");
+    info!(%partition_addr, ?chunk_ids, "compacting object store chunks");
 
     let (tracker, registration) = db.jobs.register(Job::CompactObjectStoreChunks {
         partition: partition.addr().clone(),
@@ -281,10 +277,13 @@ pub(crate) fn compact_object_store_chunks(
         .map(|mut chunk| {
             // Sanity-check
             assert!(Arc::ptr_eq(&db, &chunk.data().db));
-            assert_eq!(chunk.table_name().as_ref(), addr.table_name.as_ref());
+            assert_eq!(
+                chunk.table_name().as_ref(),
+                partition_addr.table_name.as_ref()
+            );
 
             // provided chunks not in the provided partition
-            if chunk.key() != addr.partition_key.as_ref() {
+            if chunk.key() != partition_addr.partition_key.as_ref() {
                 return ChunksNotInPartition {}.fail();
             }
 
@@ -313,8 +312,6 @@ pub(crate) fn compact_object_store_chunks(
         .collect::<Result<Vec<_>>>()?;
 
     // Verify if all the provided chunks are contiguous
-    // TODO: ask Raphael if this should be done after dropping partition lock. It seems this check is better here
-    //       to avoid a situation a newly persisted chunk added after dropping lock
     if !partition.contiguous_object_store_chunks(&chunk_orders) {
         return ChunksNotContiguous {}.fail();
     }
@@ -324,7 +321,6 @@ pub(crate) fn compact_object_store_chunks(
 
     let time_of_first_write = time_of_first_write.expect("Should have had a first write somewhere");
     let time_of_last_write = time_of_last_write.expect("Should have had a last write somewhere");
-
     // Tracking metric
     let metric_registry = Arc::clone(&db.metric_registry);
     let ctx = db.exec.new_context(ExecutorType::Reorg);
@@ -347,9 +343,10 @@ pub(crate) fn compact_object_store_chunks(
         // run the plan
         let stream = ctx.execute_stream(physical_plan).await?;
 
-        // create a read buffer chunk for persisting
+        // create a read buffer chunk for persisting the compacted one
         // todo: after the code works well, this will be improved to pass this RUB pass
-        let persisting_chunk = collect_rub(stream, &addr, metric_registry.as_ref()).await?;
+        let persisting_chunk =
+            collect_rub(stream, &partition_addr, metric_registry.as_ref()).await?;
 
         // number of rows to be persisted to log when it is done
         let persisted_rows = persisting_chunk.as_ref().map(|p| p.rows()).unwrap_or(0);
@@ -357,14 +354,13 @@ pub(crate) fn compact_object_store_chunks(
         let persist_fut = {
             let partition = LockableCatalogPartition::new(Arc::clone(&db), partition);
 
-            // drop compacted chunks
-            let mut partition_write = partition.write();
+            // Drop in-memory compacted chunks
+            let mut partition = partition.write();
             let mut delete_predicates_after = HashSet::new();
             for id in &chunk_ids {
-                let chunk = partition_write.force_drop_chunk(*id).expect(
+                let chunk = partition.force_drop_chunk(*id).expect(
                     "There was a lifecycle action attached to this chunk, who deleted it?!",
                 );
-
                 // Keep the delete predicates newly added during the compacting process
                 let chunk = chunk.read();
                 for pred in chunk.delete_predicates() {
@@ -380,15 +376,22 @@ pub(crate) fn compact_object_store_chunks(
                 tmp
             };
 
-            // nothing persist if all rows are hard deleted  while compacting
+            // nothing persisted if all rows are hard deleted  while compacting
             let persisting_chunk = match persisting_chunk {
                 Some(persisting_chunk) => persisting_chunk,
                 None => {
-                    info!(%addr, ?chunk_ids, "no rows to persist, no chunk created");
-                    partition_write
+                    info!(%partition_addr, ?chunk_ids, "no rows after compacting to get persisted , no chunk created");
+                    partition
                         .persistence_windows_mut()
                         .unwrap()
                         .flush(flush_handle);
+
+                    // Todo: Need a way to drop compacted chunks here before returning
+                    // We cannot call the code below because rust does not know that we no longer need to use partition
+                    // for id in chunk_ids {
+                    //     db.drop_chunk(&*partition_addr.table_name, &*partition_addr.partition_key, id).await;
+                    // }
+
                     return Ok(None);
                 }
             };
@@ -396,7 +399,7 @@ pub(crate) fn compact_object_store_chunks(
             // Create a RUB chunk before persisting
             // This RUB will be unloaded as needed during the lifecycle's maybe_free_memory
             // todo: this step will be improved to avoid creating RUB if needed
-            let (new_chunk_id, new_chunk) = partition_write.create_rub_chunk(
+            let (new_chunk_id, new_chunk) = partition.create_rub_chunk(
                 persisting_chunk,
                 time_of_first_write,
                 time_of_last_write,
@@ -406,7 +409,7 @@ pub(crate) fn compact_object_store_chunks(
                 db.persisted_chunk_id_override.lock().as_ref().cloned(),
             );
             let persisting_chunk = LockableCatalogChunk {
-                db,
+                db: Arc::clone(&db),
                 chunk: Arc::clone(new_chunk),
                 id: new_chunk_id,
                 order: min_order,
@@ -414,11 +417,23 @@ pub(crate) fn compact_object_store_chunks(
 
             // Now write the chunk to object store
             let persisting_chunk = persisting_chunk.write();
-            write_chunk_to_object_store(partition_write, persisting_chunk, flush_handle)?.1
+            write_chunk_to_object_store(partition, persisting_chunk, flush_handle)?.1
         };
 
         // Wait for write operation to complete
         let persisted_chunk = persist_fut.await??;
+
+        // Now drop compacted chunks from preserved catalog before returning
+        for id in &chunk_ids {
+            // todo: return context for error
+            let _result = db
+                .drop_chunk(
+                    &*partition_addr.table_name,
+                    &*partition_addr.partition_key,
+                    *id,
+                )
+                .await;
+        }
 
         // input rows per second
         let elapsed = now.elapsed();
@@ -426,7 +441,7 @@ pub(crate) fn compact_object_store_chunks(
 
         info!(input_chunks=chunk_ids.len(),
             %input_rows, %persisted_rows,
-            sort_key=%key_str, compaction_took = ?elapsed, 
+            sort_key=%key_str, compaction_took = ?elapsed,
             fut_execution_duration= ?fut_now.elapsed(),
             rows_per_sec=?throughput,  "object store chunk(s) compacted");
 
