@@ -1,6 +1,9 @@
 use super::DbChunk;
 use crate::{
-    db::catalog::{chunk::CatalogChunk, partition::Partition},
+    db::{
+        catalog::{chunk::CatalogChunk, partition::Partition},
+        lifecycle::compact_object_store::compact_object_store_chunks,
+    },
     Db,
 };
 use ::lifecycle::LifecycleDb;
@@ -33,6 +36,7 @@ pub(crate) use persist::persist_chunks;
 pub(crate) use unload::unload_read_buffer_chunk;
 
 mod compact;
+mod compact_object_store;
 mod drop;
 mod error;
 mod persist;
@@ -207,7 +211,7 @@ impl LockablePartition for LockableCatalogPartition {
         handle: Self::PersistHandle,
     ) -> Result<TaskTracker<Job>, Self::Error> {
         info!(table=%partition.table_name(), partition=%partition.partition_key(), "compacting object store chunks");
-        let (tracker, fut) = persist::compact_object_store_chunks(partition, chunks, handle.0)?;
+        let (tracker, fut) = compact_object_store_chunks(partition, chunks, handle.0)?;
         let _ =
             tokio::spawn(async move { fut.await.log_if_error("compacting object store chunks") });
         Ok(tracker)
