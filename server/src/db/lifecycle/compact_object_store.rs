@@ -4,23 +4,30 @@ use super::{
     error::{ChunksNotContiguous, ChunksNotInPartition, EmptyChunks},
     LockableCatalogChunk, LockableCatalogPartition, Result,
 };
-use crate::db::{
-    catalog::{chunk::CatalogChunk, partition::Partition},
-    lifecycle::{collect_rub, merge_schemas, write::write_chunk_to_object_store},
-    DbChunk,
+use crate::{
+    db::{
+        catalog::{chunk::CatalogChunk, partition::Partition},
+        lifecycle::{collect_rub, merge_schemas, write::write_chunk_to_object_store},
+        DbChunk,
+    },
+    Db,
 };
-use data_types::{chunk_metadata::ChunkOrder, delete_predicate::DeletePredicate, job::Job};
+use data_types::{
+    chunk_metadata::ChunkOrder, delete_predicate::DeletePredicate, job::Job,
+    partition_metadata::PartitionAddr,
+};
 use lifecycle::{LifecycleWriteGuard, LockableChunk, LockablePartition};
 use observability_deps::tracing::info;
 use persistence_windows::persistence_windows::FlushHandle;
 use query::{compute_sort_key, exec::ExecutorType, frontend::reorg::ReorgPlanner, QueryChunkMeta};
+use schema::{merge::SchemaMerger, Schema};
 use std::{
     collections::{BTreeSet, HashSet},
     future::Future,
     sync::Arc,
 };
 use time::Time;
-use tracker::{TaskTracker, TrackedFuture, TrackedFutureExt};
+use tracker::{TaskRegistration, TaskTracker, TrackedFuture, TrackedFutureExt};
 
 // Compact the provided object store chunks into a single object store chunk,
 /// returning the newly created chunk
@@ -40,6 +47,9 @@ pub(crate) fn compact_object_store_chunks(
     TaskTracker<Job>,
     TrackedFuture<impl Future<Output = Result<Option<Arc<DbChunk>>>> + Send>,
 )> {
+    // =============================================================
+    // Step 1: verify the inputs while getting query chunks for compacting
+
     // no chunks provided
     if chunks.is_empty() {
         return EmptyChunks {}.fail();
@@ -60,95 +70,61 @@ pub(crate) fn compact_object_store_chunks(
 
     // Mark and snapshot chunks, then drop locks
     let mut input_rows = 0;
-    let mut time_of_first_write: Option<Time> = None;
-    let mut time_of_last_write: Option<Time> = None;
     let mut delete_predicates_before: HashSet<Arc<DeletePredicate>> = HashSet::new();
+    let mut query_chunks = vec![];
     let mut min_order = ChunkOrder::MAX;
-    let mut chunk_orders = BTreeSet::new();
-    let query_chunks = chunks
-        .into_iter()
-        .map(|mut chunk| {
-            // Sanity-check
-            assert!(Arc::ptr_eq(&db, &chunk.data().db));
-            assert_eq!(
-                chunk.table_name().as_ref(),
-                partition_addr.table_name.as_ref()
-            );
+    let (time_of_first_write, time_of_last_write) = query_chunks_to_compact(
+        partition,
+        chunks,
+        &registration,
+        &mut input_rows,
+        &mut delete_predicates_before,
+        &mut query_chunks,
+        &mut min_order,
+    )?;
 
-            // provided chunks not in the provided partition
-            if chunk.key() != partition_addr.partition_key.as_ref() {
-                return ChunksNotInPartition {}.fail();
-            }
-
-            input_rows += chunk.table_summary().total_count();
-
-            let candidate_first = chunk.time_of_first_write();
-            time_of_first_write = time_of_first_write
-                .map(|prev_first| prev_first.min(candidate_first))
-                .or(Some(candidate_first));
-
-            let candidate_last = chunk.time_of_last_write();
-            time_of_last_write = time_of_last_write
-                .map(|prev_last| prev_last.max(candidate_last))
-                .or(Some(candidate_last));
-
-            delete_predicates_before.extend(chunk.delete_predicates().iter().cloned());
-
-            min_order = min_order.min(chunk.order());
-            chunk_orders.insert(chunk.order());
-
-            // Set chunk in the right action which is compacting object store
-            // This function will also error out if the chunk is not yet persisted
-            chunk.set_compacting_object_store(&registration)?;
-            Ok(DbChunk::snapshot(&*chunk))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Verify if all the provided chunks are contiguous
-    if !partition.contiguous_object_store_chunks(&chunk_orders) {
-        return ChunksNotContiguous {}.fail();
-    }
-
-    // drop partition lock
-    let partition = partition.into_data().partition;
-
-    let time_of_first_write = time_of_first_write.expect("Should have had a first write somewhere");
-    let time_of_last_write = time_of_last_write.expect("Should have had a last write somewhere");
-    // Tracking metric
-    let metric_registry = Arc::clone(&db.metric_registry);
-    let ctx = db.exec.new_context(ExecutorType::Reorg);
-
-    // Now let start compacting
+    // The rest is done in a future
     let fut = async move {
         let fut_now = std::time::Instant::now();
 
-        // Compute the sorted output of the compacting result
-        let key = compute_sort_key(query_chunks.iter().map(|x| x.summary()));
-        let key_str = format!("\"{}\"", key); // for logging
+        // =============================================================
+        // Step 2: compact the chunks
 
-        // Merge schema of the compacting chunks
-        let schema = merge_schemas(&query_chunks);
+        let mut compacting_rows = 0;
+        let mut schema: Arc<Schema> = Arc::new(SchemaMerger::new().build());
+        let mut sort_key_str: String = String::from("");
+        let compacting_chunk = compact_query_chunks(
+            &db,
+            &partition_addr,
+            &query_chunks,
+            &mut compacting_rows,
+            &mut schema,
+            &mut sort_key_str,
+        )
+        .await?;
+        // todo: currently the data is in form of a RUB chunk. we need to by-pass RUB and go directly to OS
 
-        // Compacting query plan
-        let (schema, plan) =
-            ReorgPlanner::new().compact_plan(schema, query_chunks.iter().map(Arc::clone), key)?;
-        let physical_plan = ctx.prepare_plan(&plan).await?;
-        // run the plan
-        let stream = ctx.execute_stream(physical_plan).await?;
+        // =============================================================
+        // Step 3: persist the newly created chunk (data)
+        // todo
 
-        // create a read buffer chunk for persisting the compacted one
-        // todo: after the code works well, this will be improved to pass this RUB pass
-        let persisting_chunk =
-            collect_rub(stream, &partition_addr, metric_registry.as_ref()).await?;
+        // =============================================================
+        // Step 4: switch to newly compacted-and-persisted chunk
+        // and drop old chunks in one transaction
+        // todo
 
-        // number of rows to be persisted to log when it is done
-        let persisted_rows = persisting_chunk.as_ref().map(|p| p.rows()).unwrap_or(0);
+        // the below code will be replaced with 2 functions, one for step 3 and one for step4
 
         let persist_fut = {
+            // Lock the partition for write again
+            let partition = db
+                .partition(&*partition_addr.table_name, &*partition_addr.partition_key)
+                .unwrap(); // todo: remove this unwrap
+                           //.context(Error::PartitionNotFound{ partition: (*partition_addr.partition_key).to_string(), table: (*partition_addr.table_name).to_string()});
             let partition = LockableCatalogPartition::new(Arc::clone(&db), partition);
+            let mut partition = partition.write();
 
             // Drop in-memory compacted chunks
-            let mut partition = partition.write();
             let mut delete_predicates_after = HashSet::new();
             for id in &chunk_ids {
                 let chunk = partition.force_drop_chunk(*id).expect(
@@ -170,8 +146,8 @@ pub(crate) fn compact_object_store_chunks(
             };
 
             // nothing persisted if all rows are hard deleted  while compacting
-            let persisting_chunk = match persisting_chunk {
-                Some(persisting_chunk) => persisting_chunk,
+            let compacting_chunk = match compacting_chunk {
+                Some(compacting_chunk) => compacting_chunk,
                 None => {
                     info!(%partition_addr, ?chunk_ids, "no rows after compacting to get persisted , no chunk created");
                     partition
@@ -193,7 +169,7 @@ pub(crate) fn compact_object_store_chunks(
             // This RUB will be unloaded as needed during the lifecycle's maybe_free_memory
             // todo: this step will be improved to avoid creating RUB if needed
             let (new_chunk_id, new_chunk) = partition.create_rub_chunk(
-                persisting_chunk,
+                compacting_chunk,
                 time_of_first_write,
                 time_of_last_write,
                 schema,
@@ -233,8 +209,8 @@ pub(crate) fn compact_object_store_chunks(
         let throughput = (input_rows as u128 * 1_000_000_000) / elapsed.as_nanos();
 
         info!(input_chunks=chunk_ids.len(),
-            %input_rows, %persisted_rows,
-            sort_key=%key_str, compaction_took = ?elapsed,
+            %input_rows, %compacting_rows,
+            sort_key=%sort_key_str, compaction_took = ?elapsed,
             fut_execution_duration= ?fut_now.elapsed(),
             rows_per_sec=?throughput,  "object store chunk(s) compacted");
 
@@ -242,6 +218,122 @@ pub(crate) fn compact_object_store_chunks(
     };
 
     Ok((tracker, fut.track(registration)))
+}
+
+/// Create DBChunks of the prvoided chunks for compacting
+/// This function also verify and throw error if the chunks are not eligible
+///    . provided chunk(s) not belong to the provided partition
+///    . not all provided chunks are persisted
+///    . the provided chunks are not contiguous
+fn query_chunks_to_compact(
+    partition: LifecycleWriteGuard<'_, Partition, LockableCatalogPartition>,
+    chunks: Vec<LifecycleWriteGuard<'_, CatalogChunk, LockableCatalogChunk>>,
+    registration: &TaskRegistration,
+    input_rows: &mut u64,
+    delete_predicates_before: &mut HashSet<Arc<DeletePredicate>>,
+    query_chunks: &mut Vec<Arc<DbChunk>>,
+    min_order: &mut ChunkOrder,
+) -> Result<(Time, Time)> {
+    let db = Arc::clone(&partition.data().db);
+    let partition_addr = partition.addr().clone();
+
+    // Mark and snapshot chunks, then drop locks
+    let mut time_of_first_write: Option<Time> = None;
+    let mut time_of_last_write: Option<Time> = None;
+    let mut chunk_orders = BTreeSet::new();
+
+    *query_chunks = chunks
+        .into_iter()
+        .map(|mut chunk| {
+            // Sanity-check
+            assert!(Arc::ptr_eq(&db, &chunk.data().db));
+            assert_eq!(
+                chunk.table_name().as_ref(),
+                partition_addr.table_name.as_ref()
+            );
+
+            // provided chunks not in the provided partition
+            if chunk.key() != partition_addr.partition_key.as_ref() {
+                return ChunksNotInPartition {}.fail();
+            }
+
+            *input_rows += chunk.table_summary().total_count();
+
+            let candidate_first = chunk.time_of_first_write();
+            time_of_first_write = time_of_first_write
+                .map(|prev_first| prev_first.min(candidate_first))
+                .or(Some(candidate_first));
+
+            let candidate_last = chunk.time_of_last_write();
+            time_of_last_write = time_of_last_write
+                .map(|prev_last| prev_last.max(candidate_last))
+                .or(Some(candidate_last));
+
+            delete_predicates_before.extend(chunk.delete_predicates().iter().cloned());
+
+            *min_order = *min_order.min(&mut chunk.order());
+            chunk_orders.insert(chunk.order());
+
+            // Set chunk in the right action which is compacting object store
+            // This function will also error out if the chunk is not yet persisted
+            chunk.set_compacting_object_store(registration)?;
+            Ok(DbChunk::snapshot(&*chunk))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Verify if all the provided chunks are contiguous
+    if !partition.contiguous_object_store_chunks(&chunk_orders) {
+        return ChunksNotContiguous {}.fail();
+    }
+
+    let time_of_first_write = time_of_first_write.expect("Should have had a first write somewhere");
+    let time_of_last_write = time_of_last_write.expect("Should have had a last write somewhere");
+
+    // drop partition lock
+    let _partition = partition.into_data().partition;
+
+    Ok((time_of_first_write, time_of_last_write))
+}
+
+/// Create query plan to compact the given DbChunks and return its output stream
+async fn compact_query_chunks(
+    db: &Db,
+    partition_addr: &PartitionAddr,
+    query_chunks: &[Arc<DbChunk>],
+    compacting_rows: &mut u64,
+    schema: &mut Arc<Schema>,
+    sort_key_str: &mut String,
+) -> Result<Option<read_buffer::RBChunk>> {
+    // Tracking metric
+    let metric_registry = Arc::clone(&db.metric_registry);
+    let ctx = db.exec.new_context(ExecutorType::Reorg);
+
+    // Compute the sorted output of the compacting result
+    let key = compute_sort_key(query_chunks.iter().map(|x| x.summary()));
+    *sort_key_str = format!("\"{}\"", key); // for logging
+
+    // Merge schema of the compacting chunks
+    let merged_schema = merge_schemas(query_chunks);
+
+    // Compacting query plan
+    let (plan_schema, plan) = ReorgPlanner::new().compact_plan(
+        Arc::clone(&merged_schema),
+        query_chunks.iter().map(Arc::clone),
+        key,
+    )?;
+    let physical_plan = ctx.prepare_plan(&plan).await?;
+    // run the plan
+    let stream = ctx.execute_stream(physical_plan).await?;
+
+    // create a read buffer chunk for persisting the compacted one
+    // todo: after the code works well, this will be improved to pass this RUB pass
+    let compacting_chunk = collect_rub(stream, partition_addr, metric_registry.as_ref()).await?;
+
+    // number of rows to be persisted to log when it is done
+    *compacting_rows = compacting_chunk.as_ref().map(|p| p.rows()).unwrap_or(0);
+    *schema = plan_schema;
+
+    Ok(compacting_chunk)
 }
 
 #[cfg(test)]
@@ -260,7 +352,7 @@ mod tests {
         time::Duration,
     };
 
-    // Todo: this as copied from persist.rs and should be revived to natch the needs here
+    // Todo: this as copied from persist.rs and should be revived to match the needs here
     async fn test_db() -> (Arc<Db>, Arc<time::MockProvider>) {
         let time_provider = Arc::new(time::MockProvider::new(Time::from_timestamp(3409, 45)));
         let test_db = TestDb::builder()
@@ -584,4 +676,6 @@ mod tests {
         // 2 rows left because 4 duplicated & deleted rows have been removed
         assert_eq!(summary_chunks[1].row_count, 2);
     }
+
+    // todo: add more tests
 }

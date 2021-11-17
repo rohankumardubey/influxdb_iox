@@ -636,6 +636,40 @@ impl Db {
         fut.await.context(TaskCancelled)?.context(LifecycleError)
     }
 
+    /// Compact all provided persisted chunks
+    pub async fn compact_object_store_chunks(
+        self: &Arc<Self>,
+        table_name: &str,
+        partition_key: &str,
+        chunk_ids: Vec<ChunkId>,
+    ) -> Result<Option<Arc<DbChunk>>> {
+        if chunk_ids.is_empty() {
+            return Ok(None);
+        }
+
+        // Use explicit scope to ensure the async generator doesn't
+        // assume the locks have to possibly live across the `await`
+        let fut = {
+            let partition = self.partition(table_name, partition_key)?;
+            let partition = LockableCatalogPartition::new(Arc::clone(self), partition);
+            let partition = partition.read();
+
+            // todo: set these chunks
+            let chunks = vec![];
+
+            // Lock partition for write
+            let partition = partition.upgrade();
+
+            //invoke compact
+            // todo: use the compact_os_chunks when it has 2 arguments
+            // let (_, fut) = lifecycle::compact_object_store::compact_os_chunks(partition, chunks).context(LifecycleError)?;
+            let (_, fut) = lifecycle::compact_chunks(partition, chunks).context(LifecycleError)?;
+            fut
+        };
+
+        fut.await.context(TaskCancelled)?.context(LifecycleError)
+    }
+
     /// Persist given partition.
     ///
     /// If `force` is `true` will persist all unpersisted data regardless of arrival time

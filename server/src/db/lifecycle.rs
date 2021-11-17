@@ -1,9 +1,6 @@
 use super::DbChunk;
 use crate::{
-    db::{
-        catalog::{chunk::CatalogChunk, partition::Partition},
-        lifecycle::compact_object_store::compact_object_store_chunks,
-    },
+    db::catalog::{chunk::CatalogChunk, partition::Partition},
     Db,
 };
 use ::lifecycle::LifecycleDb;
@@ -30,6 +27,7 @@ use time::{Time, TimeProvider};
 use tracker::{RwLock, TaskTracker};
 
 pub(crate) use compact::compact_chunks;
+pub(crate) use compact_object_store::compact_object_store_chunks;
 pub(crate) use drop::{drop_chunk, drop_partition};
 pub(crate) use error::{Error, Result};
 pub(crate) use persist::persist_chunks;
