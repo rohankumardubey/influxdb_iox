@@ -1229,6 +1229,20 @@ mod test {
     }
 
     #[test]
+    fn parse_identical_tag_field_name() {
+        let input = "dupnames,day=monday day=1.2";
+        let vals = parse(input).unwrap();
+
+        assert_eq!(vals[0].series.measurement, "dupnames");
+        assert_eq!(vals[0].series.tag_set.as_ref().unwrap()[0].0, "day");
+        assert_eq!(vals[0].series.tag_set.as_ref().unwrap()[0].1, "monday");
+
+        assert_eq!(vals[0].field_set[0].0, "day");
+        assert_eq!(vals[0].field_set[0].1.unwrap_f64(), 1.2_f64);
+        assert_eq!(vals[0].timestamp, None);
+    }
+
+    #[test]
     fn parse_single_field_unteger() {
         let input = "foo asdf=23u 1234";
         let vals = parse(input).unwrap();
