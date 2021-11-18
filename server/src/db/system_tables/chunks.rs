@@ -9,6 +9,8 @@ use data_types::{chunk_metadata::ChunkSummary, error::ErrorLogger};
 use std::sync::Arc;
 use time::Time;
 
+use super::CreationOptions;
+
 /// Implementation of system.chunks table
 #[derive(Debug)]
 pub(super) struct ChunksTable {
@@ -30,7 +32,7 @@ impl IoxSystemTable for ChunksTable {
         Arc::clone(&self.schema)
     }
 
-    fn batch(&self) -> Result<RecordBatch> {
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
         from_chunk_summaries(self.schema(), self.catalog.chunk_summaries())
             .log_if_error("system.chunks table")
     }

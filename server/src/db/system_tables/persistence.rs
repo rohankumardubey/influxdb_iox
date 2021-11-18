@@ -12,6 +12,8 @@ use data_types::write_summary::WriteSummary;
 use crate::db::catalog::Catalog;
 use crate::db::system_tables::IoxSystemTable;
 
+use super::CreationOptions;
+
 /// Implementation of system.persistence_windows table
 #[derive(Debug)]
 pub(super) struct PersistenceWindowsTable {
@@ -33,7 +35,7 @@ impl IoxSystemTable for PersistenceWindowsTable {
         Arc::clone(&self.schema)
     }
 
-    fn batch(&self) -> Result<RecordBatch> {
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
         from_write_summaries(self.schema(), self.catalog.persistence_summaries())
             .log_if_error("system.persistence_windows table")
     }

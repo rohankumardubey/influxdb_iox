@@ -12,6 +12,8 @@ use data_types::{
 };
 use std::{collections::HashMap, sync::Arc};
 
+use super::CreationOptions;
+
 /// Implementation of `system.columns` system table
 #[derive(Debug)]
 pub(super) struct ColumnsTable {
@@ -32,7 +34,7 @@ impl IoxSystemTable for ColumnsTable {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-    fn batch(&self) -> Result<RecordBatch> {
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
         from_partition_summaries(self.schema(), self.catalog.partition_summaries())
             .log_if_error("system.columns table")
     }
@@ -112,7 +114,7 @@ impl IoxSystemTable for ChunkColumnsTable {
         Arc::clone(&self.schema)
     }
 
-    fn batch(&self) -> Result<RecordBatch> {
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
         assemble_chunk_columns(self.schema(), self.catalog.detailed_chunk_summaries())
             .log_if_error("system.column_chunks table")
     }

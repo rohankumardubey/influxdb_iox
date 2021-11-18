@@ -21,6 +21,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{memory::MemoryExec, ExecutionPlan},
 };
+use hashbrown::HashSet;
 use std::{any::Any, sync::Arc};
 
 mod chunks;
@@ -119,13 +120,49 @@ impl SchemaProvider for SystemSchemaProvider {
     }
 }
 
+/// Controls the creation of system tables
+#[derive(Debug, Default)]
+struct CreationOptions {
+
+    /// List of columns to make; If none, selects all columns
+    required_columns: Option<HashSet<String>>,
+
+    // TODO add limit and predicates to this (eventually)
+}
+
+impl CreationOptions {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    /// Add column_name to the list of columns to be created
+    fn with_column(self, column_name: impl Into<String>) -> Self {
+        let Self { required_columns } = self;
+
+        let mut required_columns = required_columns.unwrap_or_else(|| HashSet::new());
+        required_columns.insert(column_name.into());
+
+        Self { required_columns: Some(required_columns) }
+    }
+
+    /// returns true of this column is needed, false otherwise
+    fn needs_column(&self, column_name: impl AsRef<str>) -> bool {
+        self.required_columns.as_ref()
+            .map(|required_columns| {
+                required_columns.contains(column_name.as_ref())
+            })
+            .unwrap_or(true)
+    }
+
+}
+
 /// The minimal thing that a system table needs to implement
 trait IoxSystemTable: Send + Sync {
     /// Produce the schema from this system table
     fn schema(&self) -> SchemaRef;
 
     /// Get the contents of the system table as a single RecordBatch
-    fn batch(&self) -> Result<RecordBatch>;
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch>;
 }
 
 /// Adapter that makes any `IoxSystemTable` a DataFusion `TableProvider`
@@ -157,48 +194,32 @@ where
         _filters: &[datafusion::logical_plan::Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        scan_batch(self.inner.batch()?, self.schema(), projection.as_ref())
+
+        let schema = self.schema();
+
+        let options = match projection {
+            None => CreationOptions::new(),
+            Some(projection) => {
+                projection
+                    .iter()
+                    .try_fold(CreationOptions::new(),
+                              |options, &i| {
+                                  if i < schema.fields().len() {
+                                      let field = schema.field(i);
+                                      Ok(options.with_column(field.name()))
+                                  } else {
+                                      Err(DataFusionError::Internal(format!(
+                                          "Projection index out of range in SystemTableProvder: {}",
+                                          i
+                                      )))
+                                  }
+                              }
+                    )?
+            }
+        };
+        let batch = self.inner.batch(options)?;
+        Ok(Arc::new(MemoryExec::try_new(&[vec![batch]], schema, None)?))
     }
-}
-
-/// Creates a DataFusion ExecutionPlan node that scans a single batch
-/// of records.
-fn scan_batch(
-    batch: RecordBatch,
-    schema: SchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    // apply projection, if any
-    let (schema, batch) = match projection {
-        None => (schema, batch),
-        Some(projection) => {
-            let projected_columns: DataFusionResult<Vec<Field>> = projection
-                .iter()
-                .map(|i| {
-                    if *i < schema.fields().len() {
-                        Ok(schema.field(*i).clone())
-                    } else {
-                        Err(DataFusionError::Internal(format!(
-                            "Projection index out of range in ChunksProvider: {}",
-                            i
-                        )))
-                    }
-                })
-                .collect();
-
-            let projected_schema = Arc::new(Schema::new(projected_columns?));
-
-            let columns = projection
-                .iter()
-                .map(|i| Arc::clone(batch.column(*i)))
-                .collect::<Vec<_>>();
-
-            let projected_batch = RecordBatch::try_new(Arc::clone(&projected_schema), columns)?;
-            (projected_schema, projected_batch)
-        }
-    };
-
-    Ok(Arc::new(MemoryExec::try_new(&[vec![batch]], schema, None)?))
 }
 
 #[cfg(test)]

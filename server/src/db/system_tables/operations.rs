@@ -13,6 +13,8 @@ use tracker::TaskTracker;
 use crate::db::system_tables::IoxSystemTable;
 use crate::JobRegistry;
 
+use super::CreationOptions;
+
 /// Implementation of system.operations table
 #[derive(Debug)]
 pub(super) struct OperationsTable {
@@ -36,7 +38,7 @@ impl IoxSystemTable for OperationsTable {
         Arc::clone(&self.schema)
     }
 
-    fn batch(&self) -> Result<RecordBatch> {
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
         from_task_trackers(self.schema(), &self.db_name, self.jobs.tracked())
             .log_if_error("system.operations table")
     }
