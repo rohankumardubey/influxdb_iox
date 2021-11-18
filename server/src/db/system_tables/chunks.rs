@@ -20,6 +20,9 @@ pub(super) struct ChunksTable {
 
 impl ChunksTable {
     pub(super) fn new(catalog: Arc<Catalog>) -> Self {
+        // let builder = SystemTableCreator::new()
+        //     .with_column(...);
+
         Self {
             schema: chunk_summaries_schema(),
             catalog,
@@ -37,6 +40,9 @@ impl IoxSystemTable for ChunksTable {
             .log_if_error("system.chunks table")
     }
 }
+
+
+
 
 fn chunk_summaries_schema() -> SchemaRef {
     let ts = DataType::Timestamp(TimeUnit::Nanosecond, None);

@@ -9,11 +9,7 @@
 
 use super::catalog::Catalog;
 use crate::JobRegistry;
-use arrow::{
-    datatypes::{Field, Schema, SchemaRef},
-    error::Result,
-    record_batch::RecordBatch,
-};
+use arrow::{array::ArrayRef, datatypes::{DataType, Field, Schema, SchemaRef}, error::Result, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::{
     catalog::schema::SchemaProvider,
@@ -156,6 +152,83 @@ impl CreationOptions {
 
 }
 
+/// A function that creates an arrow array
+type CreationFunction = dyn Fn () -> ArrayRef + Send + Sync;
+
+
+/// Creates a system table
+#[derive(Default)]
+struct SystemTableBuilder {
+    name: String,
+    columns: Vec<(Field, Box<CreationFunction>)>,
+}
+
+impl SystemTableBuilder {
+    fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Register a column and a function that can create it
+    fn with_column<F>(mut self, name: &str, data_type: DataType, nullable: bool, creation: F) -> Self
+    where
+        F: Fn () -> ArrayRef + Send + Sync + 'static
+    {
+        let creation = Box::new(creation);
+        self.columns.push((Field::new(name, data_type, nullable), creation));
+        self
+    }
+
+    fn build(self) -> SystemTable {
+        let Self { name, columns} = self;
+        let (fields, creation_functions): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+
+        let schema = Arc::new(Schema::new(fields));
+        SystemTable {
+            name,
+            schema,
+            creation_functions
+        }
+    }
+}
+
+/// Creates a system table
+struct SystemTable {
+    name: String,
+    schema: SchemaRef,
+    creation_functions: Vec<Box<CreationFunction>>
+}
+
+/// TODO remove this trait and use the struct directly
+impl IoxSystemTable for SystemTable {
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Get the contents of the system table as a single RecordBatch
+    fn batch(&self, options: CreationOptions) -> Result<RecordBatch> {
+        let field_iter = self.schema.fields().iter();
+        let func_iter = self.creation_functions.iter();
+
+        let (fields, columns): (Vec<_>, Vec<_>) = field_iter.zip(func_iter)
+            .filter_map(|(field, func)| {
+                if options.needs_column(field.name()) {
+                    Some((field.clone(), func()))
+                } else {
+                    None
+                }
+            })
+            .unzip();
+
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns)
+    }
+}
+
+
 /// The minimal thing that a system table needs to implement
 trait IoxSystemTable: Send + Sync {
     /// Produce the schema from this system table
@@ -227,6 +300,7 @@ mod tests {
     use super::*;
     use arrow::array::{ArrayRef, UInt64Array};
     use arrow_util::assert_batches_eq;
+    use test_helpers::assert_contains;
 
     fn seq_array(start: u64, end: u64) -> ArrayRef {
         Arc::new(UInt64Array::from_iter_values(start..end))
@@ -234,17 +308,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_batch_no_projection() {
-        let batch = RecordBatch::try_from_iter(vec![
-            ("col1", seq_array(0, 3)),
-            ("col2", seq_array(1, 4)),
-            ("col3", seq_array(2, 5)),
-            ("col4", seq_array(3, 6)),
-        ])
-        .unwrap();
+        let system_table = SystemTableBuilder::new("foo")
+            .with_column("col1", DataType::UInt64, false, || seq_array(0, 3))
+            .with_column("col2", DataType::UInt64, false, || seq_array(1, 4))
+            .with_column("col3", DataType::UInt64, false, || seq_array(2, 5))
+            .with_column("col4", DataType::UInt64, false, || seq_array(3, 6))
+            .build();
 
-        let projection = None;
-        let scan = scan_batch(batch.clone(), batch.schema(), projection).unwrap();
-        let collected = datafusion::physical_plan::collect(scan).await.unwrap();
+        let options = CreationOptions::new();
+
+        let collected = vec![system_table.batch(options).unwrap()];
 
         let expected = vec![
             "+------+------+------+------+",
@@ -261,17 +334,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_batch_good_projection() {
-        let batch = RecordBatch::try_from_iter(vec![
-            ("col1", seq_array(0, 3)),
-            ("col2", seq_array(1, 4)),
-            ("col3", seq_array(2, 5)),
-            ("col4", seq_array(3, 6)),
-        ])
-        .unwrap();
+        let system_table = SystemTableBuilder::new("foo")
+            .with_column("col1", DataType::UInt64, false, || seq_array(0, 3))
+            .with_column("col2", DataType::UInt64, false, || seq_array(1, 4))
+            .with_column("col3", DataType::UInt64, false, || seq_array(2, 5))
+            .with_column("col4", DataType::UInt64, false, || seq_array(3, 6))
+            .build();
 
-        let projection = Some(vec![3, 1]);
-        let scan = scan_batch(batch.clone(), batch.schema(), projection.as_ref()).unwrap();
-        let collected = datafusion::physical_plan::collect(scan).await.unwrap();
+        let options = CreationOptions::new()
+            .with_column("col4")
+            .with_column("col2");
+
+        let collected = vec![system_table.batch(options).unwrap()];
 
         let expected = vec![
             "+------+------+",
@@ -288,23 +362,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_batch_bad_projection() {
-        let batch = RecordBatch::try_from_iter(vec![
-            ("col1", seq_array(0, 3)),
-            ("col2", seq_array(1, 4)),
-            ("col3", seq_array(2, 5)),
-            ("col4", seq_array(3, 6)),
-        ])
-        .unwrap();
+        let system_table = SystemTableBuilder::new("foo")
+            .with_column("col1", DataType::UInt64, false, || seq_array(0, 3))
+            .with_column("col2", DataType::UInt64, false, || seq_array(1, 4))
+            .with_column("col3", DataType::UInt64, false, || seq_array(2, 5))
+            .with_column("col4", DataType::UInt64, false, || seq_array(3, 6))
+            .build();
 
-        // no column idex 5
-        let projection = Some(vec![3, 1, 5]);
-        let result = scan_batch(batch.clone(), batch.schema(), projection.as_ref());
-        let err_string = result.unwrap_err().to_string();
-        assert!(
-            err_string
-                .contains("Internal error: Projection index out of range in ChunksProvider: 5"),
-            "Actual error: {}",
-            err_string
-        );
+        // no column "col5"
+        let options = CreationOptions::new()
+            .with_column("col4")
+            .with_column("col5");
+
+        let result = system_table.batch(options).unwrap_err().to_string();
+        assert_contains!(result, "Internal error: Projection index out of range in ChunksProvider: 5");
     }
 }
