@@ -180,4 +180,17 @@ mod tests {
             &[batch["mem"].to_arrow(Selection::All).unwrap()]
         );
     }
+
+    #[test]
+    fn test_identical_tag_field_name() {
+        let lp = "machine,space=cupboard space=102.87 0";
+
+        let batch = lines_to_batches(lp, 5).expect("accepted valid line protocol");
+
+        assert_eq!(batch.len(), 2);
+        assert_batches_eq!(
+            &["?????",],
+            &[batch["machine"].to_arrow(Selection::All).unwrap()]
+        );
+    }
 }
