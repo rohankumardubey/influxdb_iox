@@ -522,7 +522,7 @@ async fn test_create_get_update_database_omit_defaults() {
 #[tokio::test]
 async fn test_chunk_get() {
     use generated_types::influxdata::iox::management::v1::{
-        Chunk, ChunkLifecycleAction, ChunkStorage,
+        Action, Chunk, ChunkLifecycleAction, ChunkStorage,
     };
 
     let fixture = ServerFixture::create_shared(ServerType::Database).await;
@@ -560,7 +560,17 @@ async fn test_chunk_get() {
 
     let chunks = normalize_chunks(chunks);
 
-    let lifecycle_action = ChunkLifecycleAction::Unspecified.into();
+    // Since target_chunk_id is created with the chunk above, need tpo get it for comparison
+    let chunk1_uuid = chunks[0].clone().lifecycle_action.unwrap().target_chunk_id;
+    let lifecycle_action1 = ChunkLifecycleAction {
+        action: Action::Unspecified.into(),
+        target_chunk_id: chunk1_uuid,
+    };
+    let chunk2_uuid = chunks[1].clone().lifecycle_action.unwrap().target_chunk_id;
+    let lifecycle_action2 = ChunkLifecycleAction {
+        action: Action::Unspecified.into(),
+        target_chunk_id: chunk2_uuid,
+    };
 
     let expected: Vec<Chunk> = vec![
         Chunk {
@@ -568,7 +578,7 @@ async fn test_chunk_get() {
             table_name: "cpu".into(),
             id: ChunkId::new_test(0).into(),
             storage: ChunkStorage::OpenMutableBuffer.into(),
-            lifecycle_action,
+            lifecycle_action: Some(lifecycle_action1),
             memory_bytes: 1048,
             object_store_bytes: 0,
             row_count: 2,
@@ -582,7 +592,7 @@ async fn test_chunk_get() {
             table_name: "disk".into(),
             id: ChunkId::new_test(0).into(),
             storage: ChunkStorage::OpenMutableBuffer.into(),
-            lifecycle_action,
+            lifecycle_action: Some(lifecycle_action2),
             memory_bytes: 1050,
             object_store_bytes: 0,
             row_count: 1,
@@ -748,12 +758,19 @@ async fn test_list_partition_chunks() {
 
     let chunks = normalize_chunks(chunks);
 
+    // Since target_chunk_id is created with the chunk above, need tpo get it for comparison
+    let chunk_uuid = chunks[0].clone().lifecycle_action.unwrap().target_chunk_id;
+    let lifecycle_action = ChunkLifecycleAction {
+        action: Action::Unspecified.into(),
+        target_chunk_id: chunk_uuid,
+    };
+
     let expected: Vec<Chunk> = vec![Chunk {
         partition_key: "cpu".into(),
         table_name: "cpu".into(),
         id: ChunkId::new_test(0).into(),
         storage: ChunkStorage::OpenMutableBuffer.into(),
-        lifecycle_action: ChunkLifecycleAction::Unspecified.into(),
+        lifecycle_action: Some(lifecycle_action),
         memory_bytes: 1048,
         object_store_bytes: 0,
         row_count: 2,

@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 use time::Time;
+use uuid::Uuid;
 
 /// Conversion code to management API chunk structure
 impl From<ChunkSummary> for management::Chunk {
@@ -61,15 +62,32 @@ impl From<ChunkStorage> for management::ChunkStorage {
 
 impl From<Option<ChunkLifecycleAction>> for management::ChunkLifecycleAction {
     fn from(lifecycle_action: Option<ChunkLifecycleAction>) -> Self {
+        let random_uuid = ChunkId::new().get().as_bytes().to_vec();
         match lifecycle_action {
-            Some(ChunkLifecycleAction::Persisting) => Self::Persisting,
-            Some(ChunkLifecycleAction::Compacting) => Self::Compacting,
-            Some(ChunkLifecycleAction::CompactingObjectStore(_chunk_id)) => {
-                Self::CompactingObjectStore
-            } // todo: use chunk_id
-            Some(ChunkLifecycleAction::Dropping) => Self::Dropping,
-            Some(ChunkLifecycleAction::LoadingReadBuffer) => Self::LoadingReadBuffer,
-            None => Self::Unspecified,
+            Some(ChunkLifecycleAction::Persisting) => Self {
+                action: management::Action::Persisting.into(),
+                target_chunk_id: random_uuid,
+            },
+            Some(ChunkLifecycleAction::Compacting) => Self {
+                action: management::Action::Compacting.into(),
+                target_chunk_id: random_uuid,
+            },
+            Some(ChunkLifecycleAction::CompactingObjectStore(chunk_id)) => Self {
+                action: management::Action::CompactingObjectStore.into(),
+                target_chunk_id: chunk_id.get().as_bytes().to_vec(),
+            },
+            Some(ChunkLifecycleAction::Dropping) => Self {
+                action: management::Action::Dropping.into(),
+                target_chunk_id: random_uuid,
+            },
+            Some(ChunkLifecycleAction::LoadingReadBuffer) => Self {
+                action: management::Action::LoadingReadBuffer.into(),
+                target_chunk_id: random_uuid,
+            },
+            None => Self {
+                action: management::Action::Unspecified.into(),
+                target_chunk_id: random_uuid,
+            },
         }
     }
 }
@@ -116,8 +134,7 @@ impl TryFrom<management::Chunk> for ChunkSummary {
             table_name: Arc::from(table_name.as_str()),
             id: ChunkId::try_from(id).scope("id")?,
             storage: management::ChunkStorage::from_i32(storage).required("storage")?,
-            lifecycle_action: management::ChunkLifecycleAction::from_i32(lifecycle_action)
-                .required("lifecycle_action")?,
+            lifecycle_action: lifecycle_action.required("lifecycle_action")?,
             memory_bytes: memory_bytes as usize,
             object_store_bytes: object_store_bytes as usize,
             row_count: row_count as usize,
@@ -150,22 +167,30 @@ impl TryFrom<management::ChunkLifecycleAction> for Option<ChunkLifecycleAction> 
     type Error = FieldViolation;
 
     fn try_from(proto: management::ChunkLifecycleAction) -> Result<Self, Self::Error> {
-        match proto {
-            management::ChunkLifecycleAction::Persisting => {
-                Ok(Some(ChunkLifecycleAction::Persisting))
-            }
-            management::ChunkLifecycleAction::Compacting => {
-                Ok(Some(ChunkLifecycleAction::Compacting))
-            }
-            management::ChunkLifecycleAction::CompactingObjectStore => {
-                let chunk_id = ChunkId::new_test(1); // todo: need to replace 1 with a meaningful chunk_id
-                Ok(Some(ChunkLifecycleAction::CompactingObjectStore(chunk_id)))
-            }
-            management::ChunkLifecycleAction::LoadingReadBuffer => {
-                Ok(Some(ChunkLifecycleAction::LoadingReadBuffer))
-            }
-            management::ChunkLifecycleAction::Dropping => Ok(Some(ChunkLifecycleAction::Dropping)),
-            management::ChunkLifecycleAction::Unspecified => Ok(None),
+        let management::ChunkLifecycleAction {
+            action,
+            target_chunk_id,
+        } = proto;
+
+        let chunk_id: [u8; 16] = target_chunk_id.try_into().unwrap_or_else(|v: Vec<u8>| {
+            panic!("Expected a Vec of length {} but it was {}", 16, v.len())
+        });
+        let chunk_id = Uuid::from_bytes(chunk_id);
+
+        if action == management::Action::Persisting.into() {
+            Ok(Some(ChunkLifecycleAction::Persisting))
+        } else if action == management::Action::Compacting.into() {
+            Ok(Some(ChunkLifecycleAction::Compacting))
+        } else if action == management::Action::CompactingObjectStore.into() {
+            Ok(Some(ChunkLifecycleAction::CompactingObjectStore(
+                ChunkId::new_uuid(chunk_id),
+            )))
+        } else if action == management::Action::LoadingReadBuffer.into() {
+            Ok(Some(ChunkLifecycleAction::LoadingReadBuffer))
+        } else if action == management::Action::Dropping.into() {
+            Ok(Some(ChunkLifecycleAction::Dropping))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -180,6 +205,13 @@ mod test {
     #[test]
     fn valid_proto_to_summary() {
         let now = Time::from_timestamp(2, 6);
+
+        let random_uuid = ChunkId::new().get().as_bytes().to_vec();
+        let lifecycle_action = management::ChunkLifecycleAction {
+            action: management::Action::Compacting.into(),
+            target_chunk_id: random_uuid,
+        };
+
         let proto = management::Chunk {
             partition_key: "foo".to_string(),
             table_name: "bar".to_string(),
@@ -189,7 +221,7 @@ mod test {
             row_count: 321,
 
             storage: management::ChunkStorage::ObjectStoreOnly.into(),
-            lifecycle_action: management::ChunkLifecycleAction::Compacting.into(),
+            lifecycle_action: Some(lifecycle_action),
             time_of_first_write: Some(now.date_time().into()),
             time_of_last_write: Some(now.date_time().into()),
             time_of_last_access: Some(pbjson_types::Timestamp {
@@ -225,6 +257,7 @@ mod test {
     #[test]
     fn valid_summary_to_proto() {
         let now = Time::from_timestamp(756, 23);
+
         let summary = ChunkSummary {
             partition_key: Arc::from("foo"),
             table_name: Arc::from("bar"),
@@ -242,6 +275,13 @@ mod test {
 
         let proto = management::Chunk::try_from(summary).expect("conversion successful");
 
+        // due to target_chunk_id is generated randomely from the above, need to get it to compare with the below
+        let uuid = proto.clone().lifecycle_action.unwrap().target_chunk_id;
+        let lifecycle_action = management::ChunkLifecycleAction {
+            action: management::Action::Persisting.into(),
+            target_chunk_id: uuid,
+        };
+
         let expected = management::Chunk {
             partition_key: "foo".to_string(),
             table_name: "bar".to_string(),
@@ -250,7 +290,7 @@ mod test {
             object_store_bytes: 567,
             row_count: 321,
             storage: management::ChunkStorage::ObjectStoreOnly.into(),
-            lifecycle_action: management::ChunkLifecycleAction::Persisting.into(),
+            lifecycle_action: Some(lifecycle_action),
             time_of_first_write: Some(now.date_time().into()),
             time_of_last_write: Some(now.date_time().into()),
             time_of_last_access: Some(pbjson_types::Timestamp {

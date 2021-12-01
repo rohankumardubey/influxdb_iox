@@ -25,30 +25,33 @@ enum ChunkStorage {
   CHUNK_STORAGE_OBJECT_STORE_ONLY = 5;
 }
 
-
-// Is there any lifecycle action currently outstanding for this chunk?
-enum ChunkLifecycleAction {
-  // Actions that are no longer supported
-  reserved 1;
-
+enum Action {
   // No lifecycle
-  CHUNK_LIFECYCLE_ACTION_UNSPECIFIED = 0;
+  UNSPECIFIED = 0;
 
   /// Chunk is in the process of being written to object storage
-  CHUNK_LIFECYCLE_ACTION_PERSISTING = 2;
+  PERSISTING = 2;
 
   /// Chunk is in the process of being compacted
-  CHUNK_LIFECYCLE_ACTION_COMPACTING = 3;
+  COMPACTING = 3;
 
   /// Chunk is about to be dropped from memory and (if persisted) from object store.
-  CHUNK_LIFECYCLE_ACTION_DROPPING = 4;
+  DROPPING = 4;
 
   /// Chunk is in the process of being compacted
-  // todo: how to make this enum(ChunkId)?
-  CHUNK_LIFECYCLE_ACTION_COMPACTING_OBJECT_STORE = 5;
+  COMPACTING_OBJECT_STORE = 5;
 
   /// Chunk is being loaded into the read buffer
-  CHUNK_LIFECYCLE_ACTION_LOADING_READ_BUFFER = 6;
+  LOADING_READ_BUFFER = 6;
+}
+
+// Is there any lifecycle action currently outstanding for this chunk?
+message ChunkLifecycleAction {
+  Action action = 1;
+  
+  // The id of to-be-created chunk.
+  // UUID is stored as 16 bytes in big-endian order.
+  bytes target_chunk_id = 2;
 }
 
 
