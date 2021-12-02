@@ -3,6 +3,7 @@ use crate::{
     google::{FieldViolation, FieldViolationExt, FromOptionalField},
     influxdata::iox::management::v1 as management,
 };
+use bytes::Bytes;
 use data_types::chunk_metadata::{
     ChunkId, ChunkLifecycleAction, ChunkOrder, ChunkStorage, ChunkSummary,
 };
@@ -11,7 +12,6 @@ use std::{
     sync::Arc,
 };
 use time::Time;
-use uuid::Uuid;
 
 /// Conversion code to management API chunk structure
 impl From<ChunkSummary> for management::Chunk {
@@ -62,31 +62,31 @@ impl From<ChunkStorage> for management::ChunkStorage {
 
 impl From<Option<ChunkLifecycleAction>> for management::ChunkLifecycleAction {
     fn from(lifecycle_action: Option<ChunkLifecycleAction>) -> Self {
-        let random_uuid = ChunkId::new().get().as_bytes().to_vec();
+        let empty_bytes = Bytes::new();
         match lifecycle_action {
             Some(ChunkLifecycleAction::Persisting) => Self {
                 action: management::Action::Persisting.into(),
-                target_chunk_id: random_uuid,
+                target_chunk_id: empty_bytes,
             },
             Some(ChunkLifecycleAction::Compacting) => Self {
                 action: management::Action::Compacting.into(),
-                target_chunk_id: random_uuid,
+                target_chunk_id: empty_bytes,
             },
             Some(ChunkLifecycleAction::CompactingObjectStore(chunk_id)) => Self {
                 action: management::Action::CompactingObjectStore.into(),
-                target_chunk_id: chunk_id.get().as_bytes().to_vec(),
+                target_chunk_id: chunk_id.into(),
             },
             Some(ChunkLifecycleAction::Dropping) => Self {
                 action: management::Action::Dropping.into(),
-                target_chunk_id: random_uuid,
+                target_chunk_id: empty_bytes,
             },
             Some(ChunkLifecycleAction::LoadingReadBuffer) => Self {
                 action: management::Action::LoadingReadBuffer.into(),
-                target_chunk_id: random_uuid,
+                target_chunk_id: empty_bytes,
             },
             None => Self {
                 action: management::Action::Unspecified.into(),
-                target_chunk_id: random_uuid,
+                target_chunk_id: empty_bytes,
             },
         }
     }
@@ -172,19 +172,15 @@ impl TryFrom<management::ChunkLifecycleAction> for Option<ChunkLifecycleAction> 
             target_chunk_id,
         } = proto;
 
-        let chunk_id: [u8; 16] = target_chunk_id.try_into().unwrap_or_else(|v: Vec<u8>| {
-            panic!("Expected a Vec of length {} but it was {}", 16, v.len())
-        });
-        let chunk_id = Uuid::from_bytes(chunk_id);
-
         if action == management::Action::Persisting.into() {
             Ok(Some(ChunkLifecycleAction::Persisting))
         } else if action == management::Action::Compacting.into() {
             Ok(Some(ChunkLifecycleAction::Compacting))
         } else if action == management::Action::CompactingObjectStore.into() {
-            Ok(Some(ChunkLifecycleAction::CompactingObjectStore(
-                ChunkId::new_uuid(chunk_id),
-            )))
+            let chunk_id = ChunkId::try_from(target_chunk_id).unwrap_or_else(|u| {
+                panic!("Expected a UUID but it was {}", u);
+            });
+            Ok(Some(ChunkLifecycleAction::CompactingObjectStore(chunk_id)))
         } else if action == management::Action::LoadingReadBuffer.into() {
             Ok(Some(ChunkLifecycleAction::LoadingReadBuffer))
         } else if action == management::Action::Dropping.into() {
@@ -206,10 +202,9 @@ mod test {
     fn valid_proto_to_summary() {
         let now = Time::from_timestamp(2, 6);
 
-        let random_uuid = ChunkId::new().get().as_bytes().to_vec();
         let lifecycle_action = management::ChunkLifecycleAction {
             action: management::Action::Compacting.into(),
-            target_chunk_id: random_uuid,
+            target_chunk_id: Bytes::new(),
         };
 
         let proto = management::Chunk {
@@ -275,11 +270,9 @@ mod test {
 
         let proto = management::Chunk::try_from(summary).expect("conversion successful");
 
-        // due to target_chunk_id is generated randomely from the above, need to get it to compare with the below
-        let uuid = proto.clone().lifecycle_action.unwrap().target_chunk_id;
         let lifecycle_action = management::ChunkLifecycleAction {
             action: management::Action::Persisting.into(),
-            target_chunk_id: uuid,
+            target_chunk_id: Bytes::new(),
         };
 
         let expected = management::Chunk {

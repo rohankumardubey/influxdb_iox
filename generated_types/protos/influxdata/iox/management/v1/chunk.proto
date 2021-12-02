@@ -27,22 +27,22 @@ enum ChunkStorage {
 
 enum Action {
   // No lifecycle
-  UNSPECIFIED = 0;
+  ACTION_UNSPECIFIED = 0;
 
   /// Chunk is in the process of being written to object storage
-  PERSISTING = 2;
+  ACTION_PERSISTING = 2;
 
   /// Chunk is in the process of being compacted
-  COMPACTING = 3;
+  ACTION_COMPACTING = 3;
 
   /// Chunk is about to be dropped from memory and (if persisted) from object store.
-  DROPPING = 4;
+  ACTION_DROPPING = 4;
 
   /// Chunk is in the process of being compacted
-  COMPACTING_OBJECT_STORE = 5;
+  ACTION_COMPACTING_OBJECT_STORE = 5;
 
   /// Chunk is being loaded into the read buffer
-  LOADING_READ_BUFFER = 6;
+  ACTION_LOADING_READ_BUFFER = 6;
 }
 
 // Is there any lifecycle action currently outstanding for this chunk?

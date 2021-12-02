@@ -225,10 +225,6 @@ impl ChunkId {
         Self(Uuid::from_u128(id))
     }
 
-    pub fn new_uuid(id: Uuid) -> Self {
-        Self(id)
-    }
-
     /// Get inner UUID.
     pub fn get(&self) -> Uuid {
         self.0

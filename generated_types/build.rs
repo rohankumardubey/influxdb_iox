@@ -82,6 +82,7 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         .extern_path(".google.protobuf", "::pbjson_types")
         .bytes(&[
             ".influxdata.iox.management.v1.Chunk.id",
+            ".influxdata.iox.management.v1.ChunkLifecycleAction.target_chunk_id",
             ".influxdata.iox.management.v1.ClosePartitionChunkRequest.chunk_id",
             ".influxdata.iox.management.v1.CompactChunks.chunks",
             ".influxdata.iox.management.v1.CompactObjectStoreChunks.chunks",
