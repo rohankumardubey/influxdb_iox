@@ -202,7 +202,6 @@ impl Database {
             iox_object_store,
             Arc::clone(application.metric_registry()),
             Arc::clone(application.time_provider()),
-            true,
         )
         .await
         .context(CannotCreatePreservedCatalog)?;

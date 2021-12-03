@@ -91,14 +91,8 @@ pub async fn load_or_create_preserved_catalog(
                 db_name
             );
 
-            create_preserved_catalog(
-                db_name,
-                iox_object_store,
-                metric_registry,
-                time_provider,
-                skip_replay,
-            )
-            .await
+            create_preserved_catalog(db_name, iox_object_store, metric_registry, time_provider)
+                .await
         }
         Err(e) => {
             if wipe_on_error {
@@ -110,14 +104,8 @@ pub async fn load_or_create_preserved_catalog(
                     .await
                     .context(CannotWipeCatalog)?;
 
-                create_preserved_catalog(
-                    db_name,
-                    iox_object_store,
-                    metric_registry,
-                    time_provider,
-                    skip_replay,
-                )
-                .await
+                create_preserved_catalog(db_name, iox_object_store, metric_registry, time_provider)
+                    .await
             } else {
                 Err(Error::CannotLoadCatalog { source: e })
             }
@@ -133,7 +121,6 @@ pub async fn create_preserved_catalog(
     iox_object_store: Arc<IoxObjectStore>,
     metric_registry: Arc<metric::Registry>,
     time_provider: Arc<dyn TimeProvider>,
-    skip_replay: bool,
 ) -> Result<(PreservedCatalog, Catalog, Option<ReplayPlan>)> {
     let config = PreservedCatalogConfig::new(
         iox_object_store,
@@ -145,14 +132,8 @@ pub async fn create_preserved_catalog(
         .await
         .context(CannotCreateCatalog)?;
 
-    let Loader {
-        catalog, planner, ..
-    } = Loader::new(db_name, metric_registry, time_provider, skip_replay);
-    let plan = planner
-        .map(|planner| planner.build())
-        .transpose()
-        .context(CannotBuildReplayPlan)?;
-    Ok((preserved_catalog, catalog, plan))
+    let catalog = Catalog::new(Arc::from(db_name), metric_registry, time_provider);
+    Ok((preserved_catalog, catalog, None))
 }
 
 /// Helper to track data during catalog loading.
