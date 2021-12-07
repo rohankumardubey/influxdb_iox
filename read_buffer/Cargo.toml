@@ -26,6 +26,8 @@ permutation = "0.2.5"
 snafu = "0.6"
 schema = { path = "../schema" }
 workspace-hack = { path = "../workspace-hack"}
+num_cpus = "1.13.0"
+threadpool = "1.8.1" 
 
 [dev-dependencies] # In alphabetical order
 criterion = "0.3.3"

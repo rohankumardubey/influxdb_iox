@@ -3335,6 +3335,7 @@ dependencies = [
  "hashbrown",
  "itertools",
  "metric",
+ "num_cpus",
  "observability_deps",
  "packers",
  "parking_lot",
@@ -3344,6 +3345,7 @@ dependencies = [
  "schema",
  "snafu",
  "test_helpers",
+ "threadpool",
  "workspace-hack",
 ]
 
