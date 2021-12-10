@@ -6,8 +6,6 @@ edition = "2021"
 description = "Additional tracing exporters for IOx"
 
 [dependencies]
-
-async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
 observability_deps = { path = "../observability_deps" }

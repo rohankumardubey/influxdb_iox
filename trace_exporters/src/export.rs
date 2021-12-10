@@ -1,23 +1,19 @@
-use std::{any::Any, sync::Arc};
-
-use async_trait::async_trait;
 use futures::{
     future::{BoxFuture, Shared},
     FutureExt, TryFutureExt,
 };
+use observability_deps::tracing::{error, info, warn};
+use std::{any::Any, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::task::JoinError;
-
-use observability_deps::tracing::{error, info, warn};
 use trace::{span::Span, TraceCollector};
 
 /// Size of the exporter buffer
 const CHANNEL_SIZE: usize = 1000;
 
 /// An `AsyncExport` is a batched async version of `trace::TraceCollector`
-#[async_trait]
 pub trait AsyncExport: Send + 'static {
-    async fn export(&mut self, span: Vec<Span>);
+    fn export(&mut self, span: Vec<Span>) -> BoxFuture<'_, ()>;
 }
 
 /// `AsyncExporter` wraps a `AsyncExport` and sinks spans to it
@@ -114,12 +110,14 @@ impl TestAsyncExporter {
     }
 }
 
-#[async_trait]
 impl AsyncExport for TestAsyncExporter {
-    async fn export(&mut self, batch: Vec<Span>) {
-        for span in batch {
-            self.channel.send(span).await.expect("channel closed")
+    fn export(&mut self, batch: Vec<Span>) -> BoxFuture<'_, ()> {
+        async move {
+            for span in batch {
+                self.channel.send(span).await.expect("channel closed")
+            }
         }
+        .boxed()
     }
 }
 

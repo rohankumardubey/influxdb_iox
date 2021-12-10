@@ -4529,7 +4529,6 @@ dependencies = [
 name = "trace_exporters"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "futures",
  "observability_deps",

@@ -1,14 +1,11 @@
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-
-use async_trait::async_trait;
-
-use observability_deps::tracing::{error, info};
-use trace::span::Span;
-
 use crate::export::AsyncExport;
 use crate::thrift::agent::{AgentSyncClient, TAgentSyncClient};
 use crate::thrift::jaeger;
+use futures::{future::BoxFuture, FutureExt};
+use observability_deps::tracing::{error, info};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol};
+use trace::span::Span;
 
 mod span;
 
@@ -79,13 +76,15 @@ impl JaegerAgentExporter {
     }
 }
 
-#[async_trait]
 impl AsyncExport for JaegerAgentExporter {
-    async fn export(&mut self, spans: Vec<Span>) {
-        let batch = self.make_batch(spans);
-        if let Err(e) = self.client.emit_batch(batch) {
-            error!(%e, "error writing batch to jaeger agent")
+    fn export(&mut self, spans: Vec<Span>) -> BoxFuture<'_, ()> {
+        async move {
+            let batch = self.make_batch(spans);
+            if let Err(e) = self.client.emit_batch(batch) {
+                error!(%e, "error writing batch to jaeger agent")
+            }
         }
+        .boxed()
     }
 }
 
