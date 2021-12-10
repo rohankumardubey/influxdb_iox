@@ -1,11 +1,12 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use futures::{future::FusedFuture, FutureExt};
+use futures::{
+    future::{BoxFuture, FusedFuture},
+    FutureExt,
+};
 use hyper::{Body, Request, Response};
 use metric::Registry;
 use observability_deps::tracing::{error, info};
 use server::{ApplicationState, Server};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
 
@@ -55,7 +56,6 @@ impl DatabaseServerType {
     }
 }
 
-#[async_trait]
 impl ServerType for DatabaseServerType {
     type RouteError = ApplicationError;
 
@@ -67,39 +67,45 @@ impl ServerType for DatabaseServerType {
         self.application.trace_collector().clone()
     }
 
-    async fn route_http_request(
+    fn route_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<Response<Body>, Self::RouteError> {
-        self::http::route_request(self, req).await
+    ) -> BoxFuture<'_, Result<Response<Body>, Self::RouteError>> {
+        async move { self::http::route_request(self, req).await }.boxed()
     }
 
-    async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
-        self::rpc::server_grpc(self, builder_input).await
+    fn server_grpc(
+        self: Arc<Self>,
+        builder_input: RpcBuilderInput,
+    ) -> BoxFuture<'static, Result<(), RpcError>> {
+        async move { self::rpc::server_grpc(self, builder_input).await }.boxed()
     }
 
-    async fn join(self: Arc<Self>) {
-        let server_worker = self.server.join().fuse();
-        futures::pin_mut!(server_worker);
+    fn join(self: Arc<Self>) -> BoxFuture<'static, ()> {
+        async move {
+            let server_worker = self.server.join().fuse();
+            futures::pin_mut!(server_worker);
 
-        futures::select! {
-            _ = server_worker => {},
-            _ = self.shutdown.cancelled().fuse() => {},
-        }
-
-        self.server.shutdown();
-
-        if !server_worker.is_terminated() {
-            match server_worker.await {
-                Ok(_) => info!("server worker shutdown"),
-                Err(error) => error!(%error, "server worker error"),
+            futures::select! {
+                _ = server_worker => {},
+                _ = self.shutdown.cancelled().fuse() => {},
             }
+
+            self.server.shutdown();
+
+            if !server_worker.is_terminated() {
+                match server_worker.await {
+                    Ok(_) => info!("server worker shutdown"),
+                    Err(error) => error!(%error, "server worker error"),
+                }
+            }
+
+            info!("server completed shutting down");
+
+            self.application.join();
+            info!("shared application state completed shutting down");
         }
-
-        info!("server completed shutting down");
-
-        self.application.join();
-        info!("shared application state completed shutting down");
+        .boxed()
     }
 
     fn shutdown(&self) {

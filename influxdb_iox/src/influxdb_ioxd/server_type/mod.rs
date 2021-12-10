@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use hyper::{Body, Request, Response};
 use metric::Registry;
 use snafu::Snafu;
+use std::sync::Arc;
 use trace::TraceCollector;
 
 use crate::influxdb_ioxd::{http::error::HttpApiErrorSource, rpc::RpcBuilderInput};
@@ -35,7 +34,6 @@ impl From<tonic::transport::Error> for RpcError {
     }
 }
 
-#[async_trait]
 pub trait ServerType: std::fmt::Debug + Send + Sync + 'static {
     type RouteError: HttpApiErrorSource;
 
@@ -48,18 +46,22 @@ pub trait ServerType: std::fmt::Debug + Send + Sync + 'static {
     /// Route given HTTP request.
     ///
     /// Note that this is only called if none of the shared, common routes (e.g. `/health`) match.
-    async fn route_http_request(
+    fn route_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<Response<Body>, Self::RouteError>;
+    ) -> BoxFuture<'_, Result<Response<Body>, Self::RouteError>>;
 
     /// Construct and serve gRPC subsystem.
-    async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError>;
+    fn server_grpc(
+        self: Arc<Self>,
+        builder_input: RpcBuilderInput,
+    ) -> BoxFuture<'static, Result<(), RpcError>>;
 
     /// Join shutdown worker.
     ///
-    /// This MUST NOT exit before `shutdown` is called, otherwise the server is deemed to be dead and the process will exit.
-    async fn join(self: Arc<Self>);
+    /// This MUST NOT exit before `shutdown` is called, otherwise the server is deemed to be dead
+    /// and the process will exit.
+    fn join(self: Arc<Self>) -> BoxFuture<'static, ()>;
 
     /// Shutdown background worker.
     fn shutdown(&self);

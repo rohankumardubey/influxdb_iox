@@ -1526,7 +1526,6 @@ dependencies = [
  "arrow-flight",
  "arrow_util",
  "assert_cmd",
- "async-trait",
  "backtrace",
  "base64 0.13.0",
  "byteorder",
@@ -3169,7 +3168,6 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow_util",
- "async-trait",
  "data_types",
  "datafusion 0.1.0",
  "futures",

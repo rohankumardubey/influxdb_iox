@@ -2,13 +2,18 @@
 //! implemented in terms of the [`QueryDatabase`](query::QueryDatabase) and
 //! [`DatabaseStore`]
 
-use std::{collections::HashMap, sync::Arc};
-
-use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::Status;
-
+use crate::influxdb_ioxd::{
+    planner::Planner,
+    server_type::database::rpc::storage::{
+        data::{
+            fieldlist_to_measurement_fields_response, series_or_groups_to_read_response,
+            tag_keys_to_byte_vecs,
+        },
+        expr::{self, AddRpcNode, GroupByAndAggregate, Loggable, SpecialTagKeys},
+        input::GrpcInputs,
+        StorageService,
+    },
+};
 use data_types::{error::ErrorLogger, names::org_and_bucket_to_database, DatabaseName};
 use generated_types::{
     google::protobuf::Empty, offsets_response::PartitionOffsetResponse, storage_server::Storage,
@@ -28,19 +33,11 @@ use query::{
     QueryDatabase,
 };
 use server::DatabaseStore;
-
-use crate::influxdb_ioxd::{
-    planner::Planner,
-    server_type::database::rpc::storage::{
-        data::{
-            fieldlist_to_measurement_fields_response, series_or_groups_to_read_response,
-            tag_keys_to_byte_vecs,
-        },
-        expr::{self, AddRpcNode, GroupByAndAggregate, Loggable, SpecialTagKeys},
-        input::GrpcInputs,
-        StorageService,
-    },
-};
+use snafu::{OptionExt, ResultExt, Snafu};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::Status;
 use trace::ctx::SpanContext;
 
 #[derive(Debug, Snafu)]
@@ -1032,34 +1029,32 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        num::NonZeroU64,
-        sync::Arc,
-    };
-
+    use super::*;
     use data_types::chunk_metadata::ChunkId;
-    use parking_lot::Mutex;
-    use tokio_stream::wrappers::TcpListenerStream;
-
     use datafusion::logical_plan::{col, lit, Expr};
+    use futures::{future::BoxFuture, FutureExt};
     use generated_types::i_ox_testing_client::IOxTestingClient;
     use influxdb_storage_client::{
         connection::{Builder as ConnectionBuilder, Connection},
         generated_types::*,
         Client as StorageClient, OrgAndBucket,
     };
+    use metric::{Attributes, Metric, U64Counter};
     use panic_logging::SendPanicsToTracing;
+    use parking_lot::Mutex;
     use predicate::predicate::PredicateMatch;
     use query::{
         exec::Executor,
         test::{TestChunk, TestDatabase, TestError},
     };
+    use std::{
+        collections::BTreeMap,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        num::NonZeroU64,
+        sync::Arc,
+    };
     use test_helpers::{assert_contains, tracing::TracingCapture};
-
-    use super::*;
-    use metric::{Attributes, Metric, U64Counter};
+    use tokio_stream::wrappers::TcpListenerStream;
 
     fn to_str_vec(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
@@ -2324,7 +2319,6 @@ mod tests {
         }
     }
 
-    #[tonic::async_trait]
     impl DatabaseStore for TestDatabaseStore {
         type Database = TestDatabase;
         type Error = TestError;
@@ -2338,16 +2332,22 @@ mod tests {
 
         /// Retrieve the database specified by name, creating it if it
         /// doesn't exist.
-        async fn db_or_create(&self, name: &str) -> Result<Arc<Self::Database>, Self::Error> {
-            let mut databases = self.databases.lock();
+        fn db_or_create<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> BoxFuture<'a, Result<Arc<Self::Database>, Self::Error>> {
+            async move {
+                let mut databases = self.databases.lock();
 
-            if let Some(db) = databases.get(name) {
-                Ok(Arc::clone(db))
-            } else {
-                let new_db = Arc::new(TestDatabase::new(Arc::clone(&self.executor)));
-                databases.insert(name.to_string(), Arc::clone(&new_db));
-                Ok(new_db)
+                if let Some(db) = databases.get(name) {
+                    Ok(Arc::clone(db))
+                } else {
+                    let new_db = Arc::new(TestDatabase::new(Arc::clone(&self.executor)));
+                    databases.insert(name.to_string(), Arc::clone(&new_db));
+                    Ok(new_db)
+                }
             }
+            .boxed()
         }
     }
 }

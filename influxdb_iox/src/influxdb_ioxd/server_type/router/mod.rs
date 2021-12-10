@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
+use futures::{future::BoxFuture, FutureExt};
 use hyper::{Body, Request, Response};
 use metric::Registry;
 use router::server::RouterServer;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
 
@@ -42,7 +41,6 @@ impl RouterServerType {
     }
 }
 
-#[async_trait]
 impl ServerType for RouterServerType {
     type RouteError = ApplicationError;
 
@@ -54,19 +52,25 @@ impl ServerType for RouterServerType {
         self.server.trace_collector().clone()
     }
 
-    async fn route_http_request(
+    fn route_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<Response<Body>, Self::RouteError> {
-        self::http::route_request(self, req).await
+    ) -> BoxFuture<'_, Result<Response<Body>, Self::RouteError>> {
+        async move { self::http::route_request(self, req).await }.boxed()
     }
 
-    async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
-        self::rpc::server_grpc(self, builder_input).await
+    fn server_grpc(
+        self: Arc<Self>,
+        builder_input: RpcBuilderInput,
+    ) -> BoxFuture<'static, Result<(), RpcError>> {
+        async move { self::rpc::server_grpc(self, builder_input).await }.boxed()
     }
 
-    async fn join(self: Arc<Self>) {
-        self.shutdown.cancelled().await;
+    fn join(self: Arc<Self>) -> BoxFuture<'static, ()> {
+        async move {
+            self.shutdown.cancelled().await;
+        }
+        .boxed()
     }
 
     fn shutdown(&self) {

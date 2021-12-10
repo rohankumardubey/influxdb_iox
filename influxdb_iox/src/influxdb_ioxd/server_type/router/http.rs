@@ -1,10 +1,9 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use data_types::DatabaseName;
 use dml::DmlOperation;
+use futures::{future::BoxFuture, FutureExt};
 use hyper::{Body, Method, Request, Response};
 use snafu::{ResultExt, Snafu};
+use std::sync::Arc;
 
 use crate::influxdb_ioxd::http::{
     dml::{HttpDrivenDml, InnerDmlError, RequestOrResponse},
@@ -34,7 +33,6 @@ impl HttpApiErrorSource for ApplicationError {
     }
 }
 
-#[async_trait]
 impl HttpDrivenDml for RouterServerType {
     fn max_request_size(&self) -> usize {
         self.max_request_size
@@ -44,23 +42,26 @@ impl HttpDrivenDml for RouterServerType {
         Arc::clone(&self.lp_metrics)
     }
 
-    async fn write(
-        &self,
-        db_name: &DatabaseName<'_>,
+    fn write<'a>(
+        &'a self,
+        db_name: &'a DatabaseName<'_>,
         op: DmlOperation,
-    ) -> Result<(), InnerDmlError> {
-        match self.server.router(db_name) {
-            Some(router) => router
-                .write(op)
-                .await
-                .map_err(|e| InnerDmlError::InternalError {
+    ) -> BoxFuture<'a, Result<(), InnerDmlError>> {
+        async move {
+            match self.server.router(db_name) {
+                Some(router) => router
+                    .write(op)
+                    .await
+                    .map_err(|e| InnerDmlError::InternalError {
+                        db_name: db_name.to_string(),
+                        source: Box::new(e),
+                    }),
+                None => Err(InnerDmlError::DatabaseNotFound {
                     db_name: db_name.to_string(),
-                    source: Box::new(e),
                 }),
-            None => Err(InnerDmlError::DatabaseNotFound {
-                db_name: db_name.to_string(),
-            }),
+            }
         }
+        .boxed()
     }
 }
 

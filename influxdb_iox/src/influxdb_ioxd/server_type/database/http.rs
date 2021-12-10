@@ -17,7 +17,7 @@ use query::{exec::ExecutionContextProvider, QueryDatabase};
 use server::Error;
 
 // External crates
-use async_trait::async_trait;
+use futures::{future::BoxFuture, FutureExt};
 use http::header::CONTENT_TYPE;
 use hyper::{Body, Method, Request, Response};
 use observability_deps::tracing::{debug, error};
@@ -161,7 +161,6 @@ impl From<server::Error> for ApplicationError {
     }
 }
 
-#[async_trait]
 impl HttpDrivenDml for DatabaseServerType {
     fn max_request_size(&self) -> usize {
         self.max_request_size
@@ -171,23 +170,26 @@ impl HttpDrivenDml for DatabaseServerType {
         Arc::clone(&self.lp_metrics)
     }
 
-    async fn write(
-        &self,
-        db_name: &DatabaseName<'_>,
+    fn write<'a>(
+        &'a self,
+        db_name: &'a DatabaseName<'_>,
         op: DmlOperation,
-    ) -> Result<(), InnerDmlError> {
-        let db = self
-            .server
-            .db(db_name)
-            .map_err(|_| InnerDmlError::DatabaseNotFound {
-                db_name: db_name.to_string(),
-            })?;
+    ) -> BoxFuture<'a, Result<(), InnerDmlError>> {
+        async move {
+            let db = self
+                .server
+                .db(db_name)
+                .map_err(|_| InnerDmlError::DatabaseNotFound {
+                    db_name: db_name.to_string(),
+                })?;
 
-        db.store_operation(&op)
-            .map_err(|e| InnerDmlError::UserError {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })
+            db.store_operation(&op)
+                .map_err(|e| InnerDmlError::UserError {
+                    db_name: db_name.to_string(),
+                    source: Box::new(e),
+                })
+        }
+        .boxed()
     }
 }
 

@@ -1,6 +1,8 @@
-use std::sync::Arc;
-
-use async_trait::async_trait;
+use super::{
+    error::{HttpApiError, HttpApiErrorExt, HttpApiErrorSource},
+    metrics::LineProtocolMetrics,
+};
+use crate::influxdb_ioxd::{http::utils::parse_body, server_type::ServerType};
 use chrono::Utc;
 use data_types::{
     names::{org_and_bucket_to_database, OrgBucketMappingError},
@@ -8,18 +10,13 @@ use data_types::{
     DatabaseName,
 };
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
+use futures::{future::BoxFuture, FutureExt};
 use hyper::{Body, Method, Request, Response, StatusCode};
 use observability_deps::tracing::debug;
 use predicate::delete_predicate::{parse_delete_predicate, parse_http_delete_request};
 use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, Snafu};
-
-use crate::influxdb_ioxd::{http::utils::parse_body, server_type::ServerType};
-
-use super::{
-    error::{HttpApiError, HttpApiErrorExt, HttpApiErrorSource},
-    metrics::LineProtocolMetrics,
-};
+use std::sync::Arc;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Snafu)]
@@ -170,110 +167,118 @@ pub enum RequestOrResponse {
     Response(Response<Body>),
 }
 
-#[async_trait]
 pub trait HttpDrivenDml: ServerType {
     /// Routes HTTP write requests.
     ///
     /// Returns `RequestOrResponse::Response` if the request was routed,
-    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled some other way)
-    async fn route_write_http_request(
+    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled
+    /// some other way)
+    fn route_write_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<RequestOrResponse, HttpDmlError> {
-        if (req.method() != Method::POST) || (req.uri().path() != "/api/v2/write") {
-            return Ok(RequestOrResponse::Request(req));
+    ) -> BoxFuture<'_, Result<RequestOrResponse, HttpDmlError>> {
+        async move {
+            if (req.method() != Method::POST) || (req.uri().path() != "/api/v2/write") {
+                return Ok(RequestOrResponse::Request(req));
+            }
+
+            let span_ctx = req.extensions().get().cloned();
+
+            let max_request_size = self.max_request_size();
+            let lp_metrics = self.lp_metrics();
+
+            let query = req.uri().query().context(ExpectedQueryString)?;
+
+            let write_info: WriteInfo =
+                serde_urlencoded::from_str(query).context(InvalidQueryString {
+                    query_string: String::from(query),
+                })?;
+
+            let db_name = org_and_bucket_to_database(&write_info.org, &write_info.bucket)
+                .context(BucketMappingError)?;
+
+            let body = parse_body(req, max_request_size).await.context(ParseBody)?;
+
+            let body = std::str::from_utf8(&body).context(ReadingBodyAsUtf8)?;
+
+            // The time, in nanoseconds since the epoch, to assign to any points that don't
+            // contain a timestamp
+            let default_time = Utc::now().timestamp_nanos();
+
+            let (tables, stats) = match mutable_batch_lp::lines_to_batches_stats(body, default_time)
+            {
+                Ok(x) => x,
+                Err(mutable_batch_lp::Error::EmptyPayload) => {
+                    debug!("nothing to write");
+                    return Ok(RequestOrResponse::Response(
+                        Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .body(Body::empty())
+                            .unwrap(),
+                    ));
+                }
+                Err(source) => return Err(HttpDmlError::ParsingLineProtocol { source }),
+            };
+
+            debug!(
+                num_lines=stats.num_lines,
+                num_fields=stats.num_fields,
+                body_size=body.len(),
+                %db_name,
+                org=%write_info.org,
+                bucket=%write_info.bucket,
+                "inserting lines into database",
+            );
+
+            let write = DmlWrite::new(tables, DmlMeta::unsequenced(span_ctx));
+
+            match self.write(&db_name, DmlOperation::Write(write)).await {
+                Ok(_) => {
+                    lp_metrics.record_write(
+                        &db_name,
+                        stats.num_lines,
+                        stats.num_fields,
+                        body.len(),
+                        true,
+                    );
+                    Ok(RequestOrResponse::Response(
+                        Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .body(Body::empty())
+                            .unwrap(),
+                    ))
+                }
+                Err(e @ InnerDmlError::DatabaseNotFound { .. }) => {
+                    // Purposefully do not record ingest metrics
+                    Err(e.into())
+                }
+                Err(
+                    e @ (InnerDmlError::UserError { .. } | InnerDmlError::InternalError { .. }),
+                ) => {
+                    lp_metrics.record_write(
+                        &db_name,
+                        stats.num_lines,
+                        stats.num_fields,
+                        body.len(),
+                        false,
+                    );
+                    Err(e.into())
+                }
+            }
         }
-
-        let span_ctx = req.extensions().get().cloned();
-
-        let max_request_size = self.max_request_size();
-        let lp_metrics = self.lp_metrics();
-
-        let query = req.uri().query().context(ExpectedQueryString)?;
-
-        let write_info: WriteInfo =
-            serde_urlencoded::from_str(query).context(InvalidQueryString {
-                query_string: String::from(query),
-            })?;
-
-        let db_name = org_and_bucket_to_database(&write_info.org, &write_info.bucket)
-            .context(BucketMappingError)?;
-
-        let body = parse_body(req, max_request_size).await.context(ParseBody)?;
-
-        let body = std::str::from_utf8(&body).context(ReadingBodyAsUtf8)?;
-
-        // The time, in nanoseconds since the epoch, to assign to any points that don't
-        // contain a timestamp
-        let default_time = Utc::now().timestamp_nanos();
-
-        let (tables, stats) = match mutable_batch_lp::lines_to_batches_stats(body, default_time) {
-            Ok(x) => x,
-            Err(mutable_batch_lp::Error::EmptyPayload) => {
-                debug!("nothing to write");
-                return Ok(RequestOrResponse::Response(
-                    Response::builder()
-                        .status(StatusCode::NO_CONTENT)
-                        .body(Body::empty())
-                        .unwrap(),
-                ));
-            }
-            Err(source) => return Err(HttpDmlError::ParsingLineProtocol { source }),
-        };
-
-        debug!(
-            num_lines=stats.num_lines,
-            num_fields=stats.num_fields,
-            body_size=body.len(),
-            %db_name,
-            org=%write_info.org,
-            bucket=%write_info.bucket,
-            "inserting lines into database",
-        );
-
-        let write = DmlWrite::new(tables, DmlMeta::unsequenced(span_ctx));
-
-        match self.write(&db_name, DmlOperation::Write(write)).await {
-            Ok(_) => {
-                lp_metrics.record_write(
-                    &db_name,
-                    stats.num_lines,
-                    stats.num_fields,
-                    body.len(),
-                    true,
-                );
-                Ok(RequestOrResponse::Response(
-                    Response::builder()
-                        .status(StatusCode::NO_CONTENT)
-                        .body(Body::empty())
-                        .unwrap(),
-                ))
-            }
-            Err(e @ InnerDmlError::DatabaseNotFound { .. }) => {
-                // Purposefully do not record ingest metrics
-                Err(e.into())
-            }
-            Err(e @ (InnerDmlError::UserError { .. } | InnerDmlError::InternalError { .. })) => {
-                lp_metrics.record_write(
-                    &db_name,
-                    stats.num_lines,
-                    stats.num_fields,
-                    body.len(),
-                    false,
-                );
-                Err(e.into())
-            }
-        }
+        .boxed()
     }
 
     /// Routes HTTP delete requests.
     ///
     /// Returns `RequestOrResponse::Response` if the request was routed,
-    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled some other way)
-    async fn route_delete_http_request(
+    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled
+    /// some other way)
+    fn route_delete_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<RequestOrResponse, HttpDmlError> {
+    ) -> BoxFuture<'_, Result<RequestOrResponse, HttpDmlError>> {
+        async move {
         if (req.method() != Method::POST) || (req.uri().path() != "/api/v2/delete") {
             return Ok(RequestOrResponse::Request(req));
         }
@@ -325,6 +330,7 @@ pub trait HttpDrivenDml: ServerType {
             )),
             Err(e) => Err(e.into()),
         }
+    }.boxed()
     }
 
     /// Routes HTTP DML requests.
@@ -334,15 +340,19 @@ pub trait HttpDrivenDml: ServerType {
     /// - [`route_write_http_request`](Self::route_write_http_request)
     ///
     /// Returns `RequestOrResponse::Response` if the request was routed,
-    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled some other way)
-    async fn route_dml_http_request(
+    /// Returns `RequestOrResponse::Response` if the request did not match (and needs to be handled
+    /// some other way)
+    fn route_dml_http_request(
         &self,
         req: Request<Body>,
-    ) -> Result<RequestOrResponse, HttpDmlError> {
-        match self.route_delete_http_request(req).await? {
-            RequestOrResponse::Response(resp) => Ok(RequestOrResponse::Response(resp)),
-            RequestOrResponse::Request(req) => self.route_write_http_request(req).await,
+    ) -> BoxFuture<'_, Result<RequestOrResponse, HttpDmlError>> {
+        async move {
+            match self.route_delete_http_request(req).await? {
+                RequestOrResponse::Response(resp) => Ok(RequestOrResponse::Response(resp)),
+                RequestOrResponse::Request(req) => self.route_write_http_request(req).await,
+            }
         }
+        .boxed()
     }
 
     /// Max request size.
@@ -352,11 +362,11 @@ pub trait HttpDrivenDml: ServerType {
     fn lp_metrics(&self) -> Arc<LineProtocolMetrics>;
 
     /// Perform DML operation.
-    async fn write(
-        &self,
-        db_name: &DatabaseName<'_>,
+    fn write<'a>(
+        &'a self,
+        db_name: &'a DatabaseName<'_>,
         op: DmlOperation,
-    ) -> Result<(), InnerDmlError>;
+    ) -> BoxFuture<'a, Result<(), InnerDmlError>>;
 }
 
 #[derive(Debug, Deserialize)]
