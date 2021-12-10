@@ -8,9 +8,9 @@ description = "Tests of the query engine against different database configuratio
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1"
 data_types = { path = "../data_types" }
 datafusion = { path = "../datafusion" }
+futures = "0.3"
 once_cell = { version = "1.4.0", features = ["parking_lot"] }
 predicate = { path = "../predicate" }
 query = { path = "../query" }

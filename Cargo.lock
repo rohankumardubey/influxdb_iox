@@ -3173,6 +3173,7 @@ dependencies = [
  "async-trait",
  "data_types",
  "datafusion 0.1.0",
+ "futures",
  "metric",
  "object_store",
  "once_cell",
