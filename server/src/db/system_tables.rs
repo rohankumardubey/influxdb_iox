@@ -14,13 +14,13 @@ use arrow::{
     error::Result,
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
 use datafusion::{
     catalog::schema::SchemaProvider,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{memory::MemoryExec, ExecutionPlan},
 };
+use futures::FutureExt;
 use std::{any::Any, sync::Arc};
 
 mod chunks;
@@ -150,7 +150,6 @@ where
     inner: T,
 }
 
-#[async_trait]
 impl<T> TableProvider for SystemTableProvider<T>
 where
     T: IoxSystemTable + 'static,
@@ -163,15 +162,27 @@ where
         self.inner.schema()
     }
 
-    async fn scan(
-        &self,
-        projection: &Option<Vec<usize>>,
+    fn scan<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        projection: &'life1 Option<Vec<usize>>,
         _batch_size: usize,
         // It would be cool to push projection and limit down
-        _filters: &[datafusion::logical_plan::Expr],
+        _filters: &'life2 [datafusion::logical_plan::Expr],
         _limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        scan_batch(self.inner.batch()?, self.schema(), projection.as_ref())
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = DataFusionResult<Arc<dyn ExecutionPlan>>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move { scan_batch(self.inner.batch()?, self.schema(), projection.as_ref()) }.boxed()
     }
 }
 

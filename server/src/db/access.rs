@@ -1,17 +1,13 @@
 //! This module contains the interface to the Catalog / Chunks used by
 //! the query engine
 
-use crate::{db::system_tables, JobRegistry};
-use std::{any::Any, sync::Arc};
-
 use super::{
     catalog::{Catalog, TableNameFilter},
     chunk::DbChunk,
     query_log::QueryLog,
     Error, Result,
 };
-
-use async_trait::async_trait;
+use crate::{db::system_tables, JobRegistry};
 use data_types::chunk_metadata::ChunkSummary;
 use datafusion::{
     catalog::{catalog::CatalogProvider, schema::SchemaProvider},
@@ -25,6 +21,7 @@ use query::{
     QueryChunk, QueryChunkMeta, DEFAULT_SCHEMA,
 };
 use schema::Schema;
+use std::{any::Any, sync::Arc};
 use system_tables::{SystemSchemaProvider, SYSTEM_SCHEMA};
 
 use hashbrown::HashMap;
@@ -216,7 +213,6 @@ impl PruningObserver for ChunkAccess {
     }
 }
 
-#[async_trait]
 impl QueryDatabase for QueryCatalogAccess {
     type Error = Error;
     type Chunk = DbChunk;

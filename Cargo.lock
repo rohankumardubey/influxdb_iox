@@ -3812,7 +3812,6 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow_util",
- "async-trait",
  "bytes",
  "cache_loader_async",
  "chrono",

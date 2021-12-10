@@ -1,6 +1,10 @@
 //! This module contains the main IOx Database object which has the
 //! instances of the mutable buffer, read buffer, and object store
 
+use ::lifecycle::select_persistable_chunks;
+use parking_lot::{Mutex, RwLock};
+use rand_distr::{Distribution, Poisson};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
@@ -10,12 +14,6 @@ use std::{
     },
     time::Duration,
 };
-
-use ::lifecycle::select_persistable_chunks;
-use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
-use rand_distr::{Distribution, Poisson};
-use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 pub use ::lifecycle::{LifecycleChunk, LockableChunk, LockablePartition};
 use data_types::{
@@ -1191,7 +1189,6 @@ impl Db {
     }
 }
 
-#[async_trait]
 /// Convenience implementation of `Database` so the rest of the code
 /// can just use Db as a `Database` even though the implementation
 /// lives in `catalog_access`

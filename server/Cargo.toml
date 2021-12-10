@@ -7,7 +7,6 @@ edition = "2021"
 [dependencies] # In alphabetical order
 arrow = { version = "6.0", features = ["prettyprint"] }
 arrow_util = { path = "../arrow_util" }
-async-trait = "0.1"
 bytes = "1.0"
 chrono = { version = "0.4", default-features = false }
 cache_loader_async = { version = "0.1.2", features = ["ttl-cache"] }
