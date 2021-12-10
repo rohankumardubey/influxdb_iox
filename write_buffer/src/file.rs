@@ -120,10 +120,9 @@ use std::{
 };
 
 use crate::codec::{ContentType, IoxHeaders};
-use async_trait::async_trait;
 use data_types::{sequence::Sequence, write_buffer::WriteBufferCreationConfig};
 use dml::{DmlMeta, DmlOperation};
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
 use pin_project::pin_project;
 use time::{Time, TimeProvider};
 use tokio_util::sync::ReusableBoxFuture;
@@ -164,90 +163,93 @@ impl FileBufferProducer {
     }
 }
 
-#[async_trait]
 impl WriteBufferWriting for FileBufferProducer {
     fn sequencer_ids(&self) -> BTreeSet<u32> {
         self.dirs.keys().cloned().collect()
     }
 
-    async fn store_operation(
-        &self,
+    fn store_operation<'a>(
+        &'a self,
         sequencer_id: u32,
-        operation: &DmlOperation,
-    ) -> Result<DmlMeta, WriteBufferError> {
-        let sequencer_path = self
-            .dirs
-            .get(&sequencer_id)
-            .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
-            })?;
-
-        // measure time
-
-        let now = operation
-            .meta()
-            .producer_ts()
-            .unwrap_or_else(|| self.time_provider.now());
-
-        // assemble message
-        let mut message: Vec<u8> = format!("{}: {}\n", HEADER_TIME, now.to_rfc3339()).into_bytes();
-        let iox_headers = IoxHeaders::new(
-            ContentType::Protobuf,
-            operation.meta().span_context().cloned(),
-        );
-
-        for (name, value) in iox_headers.headers() {
-            message.extend(format!("{}: {}\n", name, value).into_bytes())
-        }
-
-        message.extend(b"\n");
-
-        crate::codec::encode_operation(&self.db_name, operation, &mut message)?;
-
-        // write data to scratchpad file in temp directory
-        let temp_file = sequencer_path.join("temp").join(Uuid::new_v4().to_string());
-        tokio::fs::write(&temp_file, &message).await?;
-
-        // scan existing files to figure out new sequence number
-        let committed = sequencer_path.join("committed");
-        let existing_files = scan_dir::<u64>(&committed, FileType::File).await?;
-        let mut sequence_number = if let Some(max) = existing_files.keys().max() {
-            max.checked_add(1).ok_or_else::<WriteBufferError, _>(|| {
-                "Overflow during sequence number calculation"
-                    .to_string()
-                    .into()
-            })?
-        } else {
-            0
-        };
-
-        // try to link scratchpad file to "current" dir
-        loop {
-            let committed_file = committed.join(sequence_number.to_string());
-            if tokio::fs::hard_link(&temp_file, &committed_file)
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            sequence_number = sequence_number
-                .checked_add(1)
+        operation: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>> {
+        async move {
+            let sequencer_path = self
+                .dirs
+                .get(&sequencer_id)
                 .ok_or_else::<WriteBufferError, _>(|| {
+                    format!("Unknown sequencer: {}", sequencer_id).into()
+                })?;
+
+            // measure time
+
+            let now = operation
+                .meta()
+                .producer_ts()
+                .unwrap_or_else(|| self.time_provider.now());
+
+            // assemble message
+            let mut message: Vec<u8> =
+                format!("{}: {}\n", HEADER_TIME, now.to_rfc3339()).into_bytes();
+            let iox_headers = IoxHeaders::new(
+                ContentType::Protobuf,
+                operation.meta().span_context().cloned(),
+            );
+
+            for (name, value) in iox_headers.headers() {
+                message.extend(format!("{}: {}\n", name, value).into_bytes())
+            }
+
+            message.extend(b"\n");
+
+            crate::codec::encode_operation(&self.db_name, operation, &mut message)?;
+
+            // write data to scratchpad file in temp directory
+            let temp_file = sequencer_path.join("temp").join(Uuid::new_v4().to_string());
+            tokio::fs::write(&temp_file, &message).await?;
+
+            // scan existing files to figure out new sequence number
+            let committed = sequencer_path.join("committed");
+            let existing_files = scan_dir::<u64>(&committed, FileType::File).await?;
+            let mut sequence_number = if let Some(max) = existing_files.keys().max() {
+                max.checked_add(1).ok_or_else::<WriteBufferError, _>(|| {
                     "Overflow during sequence number calculation"
                         .to_string()
                         .into()
-                })?;
+                })?
+            } else {
+                0
+            };
+
+            // try to link scratchpad file to "current" dir
+            loop {
+                let committed_file = committed.join(sequence_number.to_string());
+                if tokio::fs::hard_link(&temp_file, &committed_file)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                sequence_number = sequence_number
+                    .checked_add(1)
+                    .ok_or_else::<WriteBufferError, _>(|| {
+                        "Overflow during sequence number calculation"
+                            .to_string()
+                            .into()
+                    })?;
+            }
+
+            // unlink scratchpad file (and ignore error)
+            tokio::fs::remove_file(&temp_file).await.ok();
+
+            Ok(DmlMeta::sequenced(
+                Sequence::new(sequencer_id, sequence_number),
+                now,
+                operation.meta().span_context().cloned(),
+                message.len(),
+            ))
         }
-
-        // unlink scratchpad file (and ignore error)
-        tokio::fs::remove_file(&temp_file).await.ok();
-
-        Ok(DmlMeta::sequenced(
-            Sequence::new(sequencer_id, sequence_number),
-            now,
-            operation.meta().span_context().cloned(),
-            message.len(),
-        ))
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -284,7 +286,6 @@ impl FileBufferConsumer {
     }
 }
 
-#[async_trait]
 impl WriteBufferReading for FileBufferConsumer {
     fn streams(&mut self) -> BTreeMap<u32, WriteStream<'_>> {
         let mut streams = BTreeMap::default();
@@ -320,22 +321,25 @@ impl WriteBufferReading for FileBufferConsumer {
         streams
     }
 
-    async fn seek(
+    fn seek(
         &mut self,
         sequencer_id: u32,
         sequence_number: u64,
-    ) -> Result<(), WriteBufferError> {
-        let path_and_next_sequence_number = self
-            .dirs
-            .get(&sequencer_id)
-            .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
-            })?;
-        path_and_next_sequence_number
-            .1
-            .store(sequence_number, Ordering::SeqCst);
+    ) -> BoxFuture<'_, Result<(), WriteBufferError>> {
+        async move {
+            let path_and_next_sequence_number = self
+                .dirs
+                .get(&sequencer_id)
+                .ok_or_else::<WriteBufferError, _>(|| {
+                    format!("Unknown sequencer: {}", sequencer_id).into()
+                })?;
+            path_and_next_sequence_number
+                .1
+                .store(sequence_number, Ordering::SeqCst);
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -684,21 +688,23 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TestAdapter for FileTestAdapter {
         type Context = FileTestContext;
 
-        async fn new_context_with_time(
+        fn new_context_with_time(
             &self,
             n_sequencers: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
-        ) -> Self::Context {
-            FileTestContext {
-                path: self.tempdir.path().to_path_buf(),
-                database_name: format!("test_db_{}", Uuid::new_v4()),
-                n_sequencers,
-                time_provider,
+        ) -> BoxFuture<'_, Self::Context> {
+            async move {
+                FileTestContext {
+                    path: self.tempdir.path().to_path_buf(),
+                    database_name: format!("test_db_{}", Uuid::new_v4()),
+                    n_sequencers,
+                    time_provider,
+                }
             }
+            .boxed()
         }
     }
 
@@ -718,32 +724,43 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TestContext for FileTestContext {
         type Writing = FileBufferProducer;
         type Reading = FileBufferConsumer;
 
-        async fn writing(&self, creation_config: bool) -> Result<Self::Writing, WriteBufferError> {
-            FileBufferProducer::new(
-                &self.path,
-                &self.database_name,
-                self.creation_config(creation_config).as_ref(),
-                Arc::clone(&self.time_provider),
-            )
-            .await
+        fn writing(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Writing, WriteBufferError>> {
+            async move {
+                FileBufferProducer::new(
+                    &self.path,
+                    &self.database_name,
+                    self.creation_config(creation_config).as_ref(),
+                    Arc::clone(&self.time_provider),
+                )
+                .await
+            }
+            .boxed()
         }
 
-        async fn reading(&self, creation_config: bool) -> Result<Self::Reading, WriteBufferError> {
-            let trace_collector: Arc<dyn TraceCollector> =
-                Arc::new(RingBufferTraceCollector::new(5));
+        fn reading(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Reading, WriteBufferError>> {
+            async move {
+                let trace_collector: Arc<dyn TraceCollector> =
+                    Arc::new(RingBufferTraceCollector::new(5));
 
-            FileBufferConsumer::new(
-                &self.path,
-                &self.database_name,
-                self.creation_config(creation_config).as_ref(),
-                Some(&trace_collector),
-            )
-            .await
+                FileBufferConsumer::new(
+                    &self.path,
+                    &self.database_name,
+                    self.creation_config(creation_config).as_ref(),
+                    Some(&trace_collector),
+                )
+                .await
+            }
+            .boxed()
         }
     }
 

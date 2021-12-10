@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1"
 data_types = { path = "../data_types" }
 dml = { path = "../dml" }
 dotenv = "0.15.0"

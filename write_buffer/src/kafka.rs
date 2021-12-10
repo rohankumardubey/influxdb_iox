@@ -1,5 +1,4 @@
-use async_trait::async_trait;
-use futures::{FutureExt, StreamExt};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use metric::{Metric, U64Gauge, U64Histogram, U64HistogramOptions};
 use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
@@ -75,18 +74,18 @@ impl std::fmt::Debug for KafkaBufferProducer {
     }
 }
 
-#[async_trait]
 impl WriteBufferWriting for KafkaBufferProducer {
     fn sequencer_ids(&self) -> BTreeSet<u32> {
         self.partitions.clone()
     }
 
     /// Send an `Entry` to Kafka using the sequencer ID as a partition.
-    async fn store_operation(
-        &self,
+    fn store_operation<'a>(
+        &'a self,
         sequencer_id: u32,
-        operation: &DmlOperation,
-    ) -> Result<DmlMeta, WriteBufferError> {
+        operation: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>> {
+        async move {
         let partition = i32::try_from(sequencer_id)?;
 
         // truncate milliseconds from timestamps because that's what Kafka supports
@@ -135,6 +134,7 @@ impl WriteBufferWriting for KafkaBufferProducer {
             operation.meta().span_context().cloned(),
             kafka_write_size,
         ))
+    }.boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -235,7 +235,6 @@ where
             .sum::<usize>()
 }
 
-#[async_trait]
 impl WriteBufferReading for KafkaBufferConsumer {
     fn streams(&mut self) -> BTreeMap<u32, WriteStream<'_>> {
         let mut streams = BTreeMap::new();
@@ -331,33 +330,36 @@ impl WriteBufferReading for KafkaBufferConsumer {
         streams
     }
 
-    async fn seek(
+    fn seek(
         &mut self,
         sequencer_id: u32,
         sequence_number: u64,
-    ) -> Result<(), WriteBufferError> {
-        if let Some(consumer) = self.consumers.get(&sequencer_id) {
-            let consumer = Arc::clone(consumer);
-            let database_name = self.database_name.clone();
-            let offset = if sequence_number > 0 {
-                Offset::Offset(sequence_number as i64)
-            } else {
-                Offset::Beginning
-            };
+    ) -> BoxFuture<'_, Result<(), WriteBufferError>> {
+        async move {
+            if let Some(consumer) = self.consumers.get(&sequencer_id) {
+                let consumer = Arc::clone(consumer);
+                let database_name = self.database_name.clone();
+                let offset = if sequence_number > 0 {
+                    Offset::Offset(sequence_number as i64)
+                } else {
+                    Offset::Beginning
+                };
 
-            tokio::task::spawn_blocking(move || {
-                consumer.seek(
-                    &database_name,
-                    sequencer_id as i32,
-                    offset,
-                    Duration::from_millis(KAFKA_OPERATION_TIMEOUT_MS),
-                )
-            })
-            .await
-            .expect("subtask failed")?;
+                tokio::task::spawn_blocking(move || {
+                    consumer.seek(
+                        &database_name,
+                        sequencer_id as i32,
+                        offset,
+                        Duration::from_millis(KAFKA_OPERATION_TIMEOUT_MS),
+                    )
+                })
+                .await
+                .expect("subtask failed")?;
+            }
+
+            Ok(())
         }
-
-        Ok(())
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -812,23 +814,25 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TestAdapter for KafkaTestAdapter {
         type Context = KafkaTestContext;
 
-        async fn new_context_with_time(
+        fn new_context_with_time(
             &self,
             n_sequencers: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
-        ) -> Self::Context {
-            KafkaTestContext {
-                conn: self.conn.clone(),
-                database_name: random_topic_name(),
-                server_id_counter: AtomicU32::new(1),
-                n_sequencers,
-                time_provider,
-                metric_registry: metric::Registry::new(),
+        ) -> BoxFuture<'_, Self::Context> {
+            async move {
+                KafkaTestContext {
+                    conn: self.conn.clone(),
+                    database_name: random_topic_name(),
+                    server_id_counter: AtomicU32::new(1),
+                    n_sequencers,
+                    time_provider,
+                    metric_registry: metric::Registry::new(),
+                }
             }
+            .boxed()
         }
     }
 
@@ -859,40 +863,51 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TestContext for KafkaTestContext {
         type Writing = KafkaBufferProducer;
 
         type Reading = KafkaBufferConsumer;
 
-        async fn writing(&self, creation_config: bool) -> Result<Self::Writing, WriteBufferError> {
-            KafkaBufferProducer::new(
-                &self.conn,
-                &self.database_name,
-                &self.connection_config(),
-                self.creation_config(creation_config).as_ref(),
-                Arc::clone(&self.time_provider),
-                &self.metric_registry,
-            )
-            .await
+        fn writing(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Writing, WriteBufferError>> {
+            async move {
+                KafkaBufferProducer::new(
+                    &self.conn,
+                    &self.database_name,
+                    &self.connection_config(),
+                    self.creation_config(creation_config).as_ref(),
+                    Arc::clone(&self.time_provider),
+                    &self.metric_registry,
+                )
+                .await
+            }
+            .boxed()
         }
 
-        async fn reading(&self, creation_config: bool) -> Result<Self::Reading, WriteBufferError> {
-            let server_id = self.server_id_counter.fetch_add(1, Ordering::SeqCst);
-            let server_id = ServerId::try_from(server_id).unwrap();
+        fn reading(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Reading, WriteBufferError>> {
+            async move {
+                let server_id = self.server_id_counter.fetch_add(1, Ordering::SeqCst);
+                let server_id = ServerId::try_from(server_id).unwrap();
 
-            let collector: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
+                let collector: Arc<dyn TraceCollector> = Arc::new(RingBufferTraceCollector::new(5));
 
-            KafkaBufferConsumer::new(
-                &self.conn,
-                server_id,
-                &self.database_name,
-                &self.connection_config(),
-                self.creation_config(creation_config).as_ref(),
-                Some(&collector),
-                &self.metric_registry,
-            )
-            .await
+                KafkaBufferConsumer::new(
+                    &self.conn,
+                    server_id,
+                    &self.database_name,
+                    &self.connection_config(),
+                    self.creation_config(creation_config).as_ref(),
+                    Some(&collector),
+                    &self.metric_registry,
+                )
+                .await
+            }
+            .boxed()
         }
     }
 

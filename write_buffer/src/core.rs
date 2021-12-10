@@ -1,11 +1,9 @@
+use dml::{DmlMeta, DmlOperation, DmlWrite};
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
 };
-
-use async_trait::async_trait;
-use dml::{DmlMeta, DmlOperation, DmlWrite};
-use futures::{future::BoxFuture, stream::BoxStream};
 
 /// Generic boxed error type that is used in this crate.
 ///
@@ -14,7 +12,6 @@ pub type WriteBufferError = Box<dyn std::error::Error + Sync + Send>;
 
 /// Writing to a Write Buffer takes a [`DmlWrite`] and returns the [`DmlMeta`] for the
 /// payload that was written
-#[async_trait]
 pub trait WriteBufferWriting: Sync + Send + Debug + 'static {
     /// List all known sequencers.
     ///
@@ -26,25 +23,28 @@ pub trait WriteBufferWriting: Sync + Send + Debug + 'static {
     /// The [`dml::DmlMeta`] will be propagated where applicable
     ///
     /// Returns the metadata that was written
-    async fn store_operation(
-        &self,
+    fn store_operation<'a>(
+        &'a self,
         sequencer_id: u32,
-        operation: &DmlOperation,
-    ) -> Result<DmlMeta, WriteBufferError>;
+        operation: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>>;
 
     /// Sends line protocol to the write buffer - primarily intended for testing
-    async fn store_lp(
-        &self,
+    fn store_lp<'a>(
+        &'a self,
         sequencer_id: u32,
-        lp: &str,
+        lp: &'a str,
         default_time: i64,
-    ) -> Result<DmlMeta, WriteBufferError> {
-        let tables = mutable_batch_lp::lines_to_batches(lp, default_time).map_err(Box::new)?;
-        self.store_operation(
-            sequencer_id,
-            &DmlOperation::Write(DmlWrite::new(tables, Default::default())),
-        )
-        .await
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>> {
+        async move {
+            let tables = mutable_batch_lp::lines_to_batches(lp, default_time).map_err(Box::new)?;
+            self.store_operation(
+                sequencer_id,
+                &DmlOperation::Write(DmlWrite::new(tables, Default::default())),
+            )
+            .await
+        }
+        .boxed()
     }
 
     /// Return type (like `"mock"` or `"kafka"`) of this writer.
@@ -73,7 +73,6 @@ impl<'a> Debug for WriteStream<'a> {
 }
 
 /// Produce streams (one per sequencer) of [`DmlWrite`]s.
-#[async_trait]
 pub trait WriteBufferReading: Sync + Send + Debug + 'static {
     /// Returns a stream per sequencer.
     ///
@@ -87,11 +86,11 @@ pub trait WriteBufferReading: Sync + Send + Debug + 'static {
     /// the given sequence number (the actual sequence number might be skipped due to "holes" in the stream).
     ///
     /// Note that due to the mutable borrow, it is not possible to seek while streams exists.
-    async fn seek(
+    fn seek(
         &mut self,
         sequencer_id: u32,
         sequence_number: u64,
-    ) -> Result<(), WriteBufferError>;
+    ) -> BoxFuture<'_, Result<(), WriteBufferError>>;
 
     /// Return type (like `"mock"` or `"kafka"`) of this reader.
     fn type_name(&self) -> &'static str;
@@ -100,9 +99,8 @@ pub trait WriteBufferReading: Sync + Send + Debug + 'static {
 pub mod test_utils {
     //! Generic tests for all write buffer implementations.
     use super::{WriteBufferError, WriteBufferReading, WriteBufferWriting};
-    use async_trait::async_trait;
     use dml::{test_util::assert_write_op_eq, DmlMeta, DmlOperation, DmlWrite};
-    use futures::{StreamExt, TryStreamExt};
+    use futures::{future::BoxFuture, FutureExt, StreamExt, TryStreamExt};
     use std::{
         collections::{BTreeMap, BTreeSet},
         convert::TryFrom,
@@ -120,31 +118,32 @@ pub mod test_utils {
     }
 
     /// Adapter to make a concrete write buffer implementation work w/ [`perform_generic_tests`].
-    #[async_trait]
     pub trait TestAdapter: Send + Sync {
         /// The context type that is used.
         type Context: TestContext;
 
         /// Create a new context.
         ///
-        /// This will be called multiple times during the test suite. Each resulting context must represent an isolated
-        /// environment.
-        async fn new_context(&self, n_sequencers: NonZeroU32) -> Self::Context {
-            self.new_context_with_time(n_sequencers, Arc::new(time::SystemProvider::new()))
-                .await
+        /// This will be called multiple times during the test suite. Each resulting context must
+        /// represent an isolated environment.
+        fn new_context(&self, n_sequencers: NonZeroU32) -> BoxFuture<'_, Self::Context> {
+            async move {
+                self.new_context_with_time(n_sequencers, Arc::new(time::SystemProvider::new()))
+                    .await
+            }
+            .boxed()
         }
 
-        async fn new_context_with_time(
+        fn new_context_with_time(
             &self,
             n_sequencers: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
-        ) -> Self::Context;
+        ) -> BoxFuture<'_, Self::Context>;
     }
 
     /// Context used during testing.
     ///
     /// Represents an isolated environment. Actions like sequencer creations and writes must not leak across context boundaries.
-    #[async_trait]
     pub trait TestContext: Send + Sync {
         /// Write buffer writer implementation specific to this context and adapter.
         type Writing: WriteBufferWriting;
@@ -153,10 +152,16 @@ pub mod test_utils {
         type Reading: WriteBufferReading;
 
         /// Create new writer.
-        async fn writing(&self, creation_config: bool) -> Result<Self::Writing, WriteBufferError>;
+        fn writing(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Writing, WriteBufferError>>;
 
         /// Create new reader.
-        async fn reading(&self, creation_config: bool) -> Result<Self::Reading, WriteBufferError>;
+        fn reading(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Reading, WriteBufferError>>;
     }
 
     /// Generic test suite that must be passed by all proper write buffer implementations.

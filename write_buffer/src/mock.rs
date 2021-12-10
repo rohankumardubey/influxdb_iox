@@ -5,8 +5,7 @@ use std::{
     task::{Poll, Waker},
 };
 
-use async_trait::async_trait;
-use futures::{stream, FutureExt, StreamExt};
+use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use parking_lot::Mutex;
 
 use data_types::sequence::Sequence;
@@ -253,7 +252,6 @@ impl MockBufferForWriting {
     }
 }
 
-#[async_trait]
 impl WriteBufferWriting for MockBufferForWriting {
     fn sequencer_ids(&self) -> BTreeSet<u32> {
         let mut guard = self.state.writes.lock();
@@ -261,44 +259,47 @@ impl WriteBufferWriting for MockBufferForWriting {
         entries.keys().copied().collect()
     }
 
-    async fn store_operation(
-        &self,
+    fn store_operation<'a>(
+        &'a self,
         sequencer_id: u32,
-        operation: &DmlOperation,
-    ) -> Result<DmlMeta, WriteBufferError> {
-        let mut guard = self.state.writes.lock();
-        let writes = guard.as_mut().unwrap();
-        let writes_vec = writes
-            .get_mut(&sequencer_id)
-            .ok_or_else::<WriteBufferError, _>(|| {
-                format!("Unknown sequencer: {}", sequencer_id).into()
-            })?;
+        operation: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>> {
+        async move {
+            let mut guard = self.state.writes.lock();
+            let writes = guard.as_mut().unwrap();
+            let writes_vec = writes
+                .get_mut(&sequencer_id)
+                .ok_or_else::<WriteBufferError, _>(|| {
+                    format!("Unknown sequencer: {}", sequencer_id).into()
+                })?;
 
-        let sequence_number = writes_vec.max_seqno.map(|n| n + 1).unwrap_or(0);
+            let sequence_number = writes_vec.max_seqno.map(|n| n + 1).unwrap_or(0);
 
-        let sequence = Sequence {
-            id: sequencer_id,
-            number: sequence_number,
-        };
+            let sequence = Sequence {
+                id: sequencer_id,
+                number: sequence_number,
+            };
 
-        let timestamp = operation
-            .meta()
-            .producer_ts()
-            .unwrap_or_else(|| self.time_provider.now());
+            let timestamp = operation
+                .meta()
+                .producer_ts()
+                .unwrap_or_else(|| self.time_provider.now());
 
-        let meta = DmlMeta::sequenced(
-            sequence,
-            timestamp,
-            operation.meta().span_context().cloned(),
-            0,
-        );
+            let meta = DmlMeta::sequenced(
+                sequence,
+                timestamp,
+                operation.meta().span_context().cloned(),
+                0,
+            );
 
-        let mut operation = operation.clone();
-        operation.set_meta(meta.clone());
+            let mut operation = operation.clone();
+            operation.set_meta(meta.clone());
 
-        writes_vec.push(Ok(operation));
+            writes_vec.push(Ok(operation));
 
-        Ok(meta)
+            Ok(meta)
+        }
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -310,21 +311,23 @@ impl WriteBufferWriting for MockBufferForWriting {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MockBufferForWritingThatAlwaysErrors;
 
-#[async_trait]
 impl WriteBufferWriting for MockBufferForWritingThatAlwaysErrors {
     fn sequencer_ids(&self) -> BTreeSet<u32> {
         IntoIterator::into_iter([0]).collect()
     }
 
-    async fn store_operation(
+    fn store_operation<'a>(
         &self,
         _sequencer_id: u32,
-        _operation: &DmlOperation,
-    ) -> Result<DmlMeta, WriteBufferError> {
-        Err(String::from(
-            "Something bad happened on the way to writing an entry in the write buffer",
-        )
-        .into())
+        _operation: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<DmlMeta, WriteBufferError>> {
+        async move {
+            Err(String::from(
+                "Something bad happened on the way to writing an entry in the write buffer",
+            )
+            .into())
+        }
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -388,7 +391,6 @@ impl std::fmt::Debug for MockBufferForReading {
     }
 }
 
-#[async_trait]
 impl WriteBufferReading for MockBufferForReading {
     fn streams(&mut self) -> BTreeMap<u32, WriteStream<'_>> {
         let sequencer_ids: Vec<_> = {
@@ -470,21 +472,24 @@ impl WriteBufferReading for MockBufferForReading {
         streams
     }
 
-    async fn seek(
+    fn seek(
         &mut self,
         sequencer_id: u32,
         sequence_number: u64,
-    ) -> Result<(), WriteBufferError> {
-        let mut playback_states = self.playback_states.lock();
+    ) -> BoxFuture<'_, Result<(), WriteBufferError>> {
+        async move {
+            let mut playback_states = self.playback_states.lock();
 
-        if let Some(playback_state) = playback_states.get_mut(&sequencer_id) {
-            playback_state.offset = sequence_number;
+            if let Some(playback_state) = playback_states.get_mut(&sequencer_id) {
+                playback_state.offset = sequence_number;
 
-            // reset position to start since seeking might go backwards
-            playback_state.vector_index = 0;
+                // reset position to start since seeking might go backwards
+                playback_state.vector_index = 0;
+            }
+
+            Ok(())
         }
-
-        Ok(())
+        .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -495,7 +500,6 @@ impl WriteBufferReading for MockBufferForReading {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MockBufferForReadingThatAlwaysErrors;
 
-#[async_trait]
 impl WriteBufferReading for MockBufferForReadingThatAlwaysErrors {
     fn streams(&mut self) -> BTreeMap<u32, WriteStream<'_>> {
         let stream = stream::poll_fn(|_ctx| {
@@ -522,12 +526,13 @@ impl WriteBufferReading for MockBufferForReadingThatAlwaysErrors {
         .collect()
     }
 
-    async fn seek(
+    fn seek(
         &mut self,
         _sequencer_id: u32,
         _sequence_number: u64,
-    ) -> Result<(), WriteBufferError> {
-        Err(String::from("Something bad happened while seeking the stream").into())
+    ) -> BoxFuture<'_, Result<(), WriteBufferError>> {
+        async move { Err(String::from("Something bad happened while seeking the stream").into()) }
+            .boxed()
     }
 
     fn type_name(&self) -> &'static str {
@@ -549,20 +554,22 @@ mod tests {
 
     struct MockTestAdapter {}
 
-    #[async_trait]
     impl TestAdapter for MockTestAdapter {
         type Context = MockTestContext;
 
-        async fn new_context_with_time(
+        fn new_context_with_time(
             &self,
             n_sequencers: NonZeroU32,
             time_provider: Arc<dyn TimeProvider>,
-        ) -> Self::Context {
-            MockTestContext {
-                state: MockBufferSharedState::uninitialized(),
-                n_sequencers,
-                time_provider,
+        ) -> BoxFuture<'_, Self::Context> {
+            async move {
+                MockTestContext {
+                    state: MockBufferSharedState::uninitialized(),
+                    n_sequencers,
+                    time_provider,
+                }
             }
+            .boxed()
         }
     }
 
@@ -581,25 +588,36 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl TestContext for MockTestContext {
         type Writing = MockBufferForWriting;
 
         type Reading = MockBufferForReading;
 
-        async fn writing(&self, creation_config: bool) -> Result<Self::Writing, WriteBufferError> {
-            MockBufferForWriting::new(
-                self.state.clone(),
-                self.creation_config(creation_config).as_ref(),
-                Arc::clone(&self.time_provider),
-            )
+        fn writing(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Writing, WriteBufferError>> {
+            async move {
+                MockBufferForWriting::new(
+                    self.state.clone(),
+                    self.creation_config(creation_config).as_ref(),
+                    Arc::clone(&self.time_provider),
+                )
+            }
+            .boxed()
         }
 
-        async fn reading(&self, creation_config: bool) -> Result<Self::Reading, WriteBufferError> {
-            MockBufferForReading::new(
-                self.state.clone(),
-                self.creation_config(creation_config).as_ref(),
-            )
+        fn reading(
+            &self,
+            creation_config: bool,
+        ) -> BoxFuture<'_, Result<Self::Reading, WriteBufferError>> {
+            async move {
+                MockBufferForReading::new(
+                    self.state.clone(),
+                    self.creation_config(creation_config).as_ref(),
+                )
+            }
+            .boxed()
         }
     }
 
