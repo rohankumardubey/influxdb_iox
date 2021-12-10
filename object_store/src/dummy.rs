@@ -1,12 +1,10 @@
 //! Crate that mimics the interface of the the various object stores
 //! but does nothing if they are not enabled.
-use std::num::NonZeroUsize;
-
-use async_trait::async_trait;
+use crate::{path::cloud::CloudPath, GetResult, ListResult, ObjectStoreApi};
 use bytes::Bytes;
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt};
 use snafu::Snafu;
-
-use crate::{path::cloud::CloudPath, GetResult, ObjectStoreApi};
+use std::num::NonZeroUsize;
 
 /// A specialized `Error` for Azure object store-related errors
 #[derive(Debug, Snafu, Clone)]
@@ -36,7 +34,6 @@ pub type MicrosoftAzure = DummyObjectStore;
 /// If gcp feature not available, use DummyObjectStore
 pub type GoogleCloudStorage = DummyObjectStore;
 
-#[async_trait]
 impl ObjectStoreApi for DummyObjectStore {
     type Path = CloudPath;
     type Error = Error;
@@ -49,36 +46,37 @@ impl ObjectStoreApi for DummyObjectStore {
         CloudPath::raw(raw)
     }
 
-    async fn put(&self, _location: &Self::Path, _bytes: Bytes) -> crate::Result<(), Self::Error> {
-        NotSupported { name: &self.name }.fail()
+    fn put<'a>(
+        &'a self,
+        _location: &'a Self::Path,
+        _bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 
-    async fn get(
-        &self,
-        _location: &Self::Path,
-    ) -> crate::Result<GetResult<Self::Error>, Self::Error> {
-        NotSupported { name: &self.name }.fail()
+    fn get<'a>(
+        &'a self,
+        _location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 
-    async fn delete(&self, _location: &Self::Path) -> crate::Result<(), Self::Error> {
-        NotSupported { name: &self.name }.fail()
+    fn delete<'a>(&'a self, _location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 
-    async fn list<'a>(
+    fn list<'a>(
         &'a self,
         _prefix: Option<&'a Self::Path>,
-    ) -> crate::Result<
-        futures::stream::BoxStream<'a, crate::Result<Vec<Self::Path>, Self::Error>>,
-        Self::Error,
-    > {
-        NotSupported { name: &self.name }.fail()
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>>>>> {
+        async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        _prefix: &Self::Path,
-    ) -> crate::Result<crate::ListResult<Self::Path>, Self::Error> {
-        NotSupported { name: &self.name }.fail()
+    fn list_with_delimiter<'a>(
+        &'a self,
+        _prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 }
 

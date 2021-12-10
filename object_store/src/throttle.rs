@@ -1,10 +1,8 @@
 //! This module contains the IOx implementation for wrapping existing object store types into an artificial "sleep" wrapper.
-use std::{convert::TryInto, sync::Mutex};
-
 use crate::{GetResult, ListResult, ObjectStoreApi, Result};
-use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
+use std::{convert::TryInto, sync::Mutex};
 use tokio::time::{sleep, Duration};
 
 /// Configuration settings for throttled store
@@ -109,7 +107,6 @@ impl<T: ObjectStoreApi> ThrottledStore<T> {
     }
 }
 
-#[async_trait]
 impl<T: ObjectStoreApi> ObjectStoreApi for ThrottledStore<T> {
     type Path = T::Path;
 
@@ -123,85 +120,108 @@ impl<T: ObjectStoreApi> ObjectStoreApi for ThrottledStore<T> {
         self.inner.path_from_raw(raw)
     }
 
-    async fn put(&self, location: &Self::Path, bytes: Bytes) -> Result<(), Self::Error> {
-        sleep(self.config().wait_put_per_call).await;
+    fn put<'a>(
+        &'a self,
+        location: &'a Self::Path,
+        bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            sleep(self.config().wait_put_per_call).await;
 
-        self.inner.put(location, bytes).await
+            self.inner.put(location, bytes).await
+        }
+        .boxed()
     }
 
-    async fn get(&self, location: &Self::Path) -> Result<GetResult<Self::Error>, Self::Error> {
-        sleep(self.config().wait_get_per_call).await;
+    fn get<'a>(
+        &'a self,
+        location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move {
+            sleep(self.config().wait_get_per_call).await;
 
-        // need to copy to avoid moving / referencing `self`
-        let wait_get_per_byte = self.config().wait_get_per_byte;
+            // need to copy to avoid moving / referencing `self`
+            let wait_get_per_byte = self.config().wait_get_per_byte;
 
-        self.inner.get(location).await.map(|result| {
-            let s = match result {
-                GetResult::Stream(s) => s,
-                GetResult::File(_, _) => unimplemented!(),
-            };
+            self.inner.get(location).await.map(|result| {
+                let s = match result {
+                    GetResult::Stream(s) => s,
+                    GetResult::File(_, _) => unimplemented!(),
+                };
 
-            GetResult::Stream(
-                s.then(move |bytes_result| async move {
-                    match bytes_result {
-                        Ok(bytes) => {
-                            let bytes_len: u32 = usize_to_u32_saturate(bytes.len());
-                            sleep(wait_get_per_byte * bytes_len).await;
-                            Ok(bytes)
+                GetResult::Stream(
+                    s.then(move |bytes_result| async move {
+                        match bytes_result {
+                            Ok(bytes) => {
+                                let bytes_len: u32 = usize_to_u32_saturate(bytes.len());
+                                sleep(wait_get_per_byte * bytes_len).await;
+                                Ok(bytes)
+                            }
+                            Err(err) => Err(err),
                         }
-                        Err(err) => Err(err),
-                    }
-                })
-                .boxed(),
-            )
-        })
+                    })
+                    .boxed(),
+                )
+            })
+        }
+        .boxed()
     }
 
-    async fn delete(&self, location: &Self::Path) -> Result<(), Self::Error> {
-        sleep(self.config().wait_delete_per_call).await;
+    fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            sleep(self.config().wait_delete_per_call).await;
 
-        self.inner.delete(location).await
+            self.inner.delete(location).await
+        }
+        .boxed()
     }
 
-    async fn list<'a>(
+    fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
-    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>, Self::Error>>, Self::Error> {
-        sleep(self.config().wait_list_per_call).await;
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>, Self::Error>>, Self::Error>>
+    {
+        async move {
+            sleep(self.config().wait_list_per_call).await;
 
-        // need to copy to avoid moving / referencing `self`
-        let wait_list_per_entry = self.config().wait_list_per_entry;
+            // need to copy to avoid moving / referencing `self`
+            let wait_list_per_entry = self.config().wait_list_per_entry;
 
-        self.inner.list(prefix).await.map(|stream| {
-            stream
-                .then(move |entries_result| async move {
-                    match entries_result {
-                        Ok(entries) => {
-                            let entries_len = usize_to_u32_saturate(entries.len());
-                            sleep(wait_list_per_entry * entries_len).await;
-                            Ok(entries)
+            self.inner.list(prefix).await.map(|stream| {
+                stream
+                    .then(move |entries_result| async move {
+                        match entries_result {
+                            Ok(entries) => {
+                                let entries_len = usize_to_u32_saturate(entries.len());
+                                sleep(wait_list_per_entry * entries_len).await;
+                                Ok(entries)
+                            }
+                            Err(err) => Err(err),
                         }
-                        Err(err) => Err(err),
-                    }
-                })
-                .boxed()
-        })
+                    })
+                    .boxed()
+            })
+        }
+        .boxed()
     }
 
-    async fn list_with_delimiter(
-        &self,
-        prefix: &Self::Path,
-    ) -> Result<ListResult<Self::Path>, Self::Error> {
-        sleep(self.config().wait_list_with_delimiter_per_call).await;
+    fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move {
+            sleep(self.config().wait_list_with_delimiter_per_call).await;
 
-        match self.inner.list_with_delimiter(prefix).await {
-            Ok(list_result) => {
-                let entries_len = usize_to_u32_saturate(list_result.objects.len());
-                sleep(self.config().wait_list_with_delimiter_per_entry * entries_len).await;
-                Ok(list_result)
+            match self.inner.list_with_delimiter(prefix).await {
+                Ok(list_result) => {
+                    let entries_len = usize_to_u32_saturate(list_result.objects.len());
+                    sleep(self.config().wait_list_with_delimiter_per_entry * entries_len).await;
+                    Ok(list_result)
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
         }
+        .boxed()
     }
 }
 

@@ -4,10 +4,9 @@ use crate::{
     path::{cloud::CloudPath, DELIMITER},
     GetResult, ListResult, ObjectMeta, ObjectStoreApi, ObjectStorePath,
 };
-use async_trait::async_trait;
 use bytes::Bytes;
 use cloud_storage::Client;
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
 use snafu::{ResultExt, Snafu};
 use std::{convert::TryFrom, env};
 
@@ -82,7 +81,6 @@ pub struct GoogleCloudStorage {
     bucket_name: String,
 }
 
-#[async_trait]
 impl ObjectStoreApi for GoogleCloudStorage {
     type Path = CloudPath;
     type Error = Error;
@@ -95,160 +93,189 @@ impl ObjectStoreApi for GoogleCloudStorage {
         CloudPath::raw(raw)
     }
 
-    async fn put(&self, location: &Self::Path, bytes: Bytes) -> Result<()> {
-        let location = location.to_raw();
-        let location_copy = location.clone();
-        let bucket_name = self.bucket_name.clone();
+    fn put<'a>(
+        &'a self,
+        location: &'a Self::Path,
+        bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let location = location.to_raw();
+            let location_copy = location.clone();
+            let bucket_name = self.bucket_name.clone();
 
-        self.client
-            .object()
-            .create(
-                &bucket_name,
-                bytes.to_vec(),
-                &location_copy,
-                "application/octet-stream",
-            )
-            .await
-            .context(UnableToPutData {
-                bucket: &self.bucket_name,
-                location,
-            })?;
+            self.client
+                .object()
+                .create(
+                    &bucket_name,
+                    bytes.to_vec(),
+                    &location_copy,
+                    "application/octet-stream",
+                )
+                .await
+                .context(UnableToPutData {
+                    bucket: &self.bucket_name,
+                    location,
+                })?;
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn get(&self, location: &Self::Path) -> Result<GetResult<Error>> {
-        let location = location.to_raw();
-        let location_copy = location.clone();
-        let bucket_name = self.bucket_name.clone();
+    fn get<'a>(
+        &'a self,
+        location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move {
+            let location = location.to_raw();
+            let location_copy = location.clone();
+            let bucket_name = self.bucket_name.clone();
 
-        let bytes = self
-            .client
-            .object()
-            .download(&bucket_name, &location_copy)
-            .await
-            .map_err(|e| match e {
-                cloud_storage::Error::Other(ref text) if text.starts_with("No such object") => {
-                    Error::NotFound {
+            let bytes = self
+                .client
+                .object()
+                .download(&bucket_name, &location_copy)
+                .await
+                .map_err(|e| match e {
+                    cloud_storage::Error::Other(ref text) if text.starts_with("No such object") => {
+                        Error::NotFound {
+                            location,
+                            source: e,
+                        }
+                    }
+                    _ => Error::UnableToGetData {
+                        bucket: bucket_name.clone(),
                         location,
                         source: e,
-                    }
-                }
-                _ => Error::UnableToGetData {
-                    bucket: bucket_name.clone(),
-                    location,
-                    source: e,
-                },
-            })?;
+                    },
+                })?;
 
-        let s = futures::stream::once(async move { Ok(bytes.into()) }).boxed();
-        Ok(GetResult::Stream(s))
+            let s = futures::stream::once(async move { Ok(bytes.into()) }).boxed();
+            Ok(GetResult::Stream(s))
+        }
+        .boxed()
     }
 
-    async fn delete(&self, location: &Self::Path) -> Result<()> {
-        let location = location.to_raw();
-        let location_copy = location.clone();
-        let bucket_name = self.bucket_name.clone();
+    fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let location = location.to_raw();
+            let location_copy = location.clone();
+            let bucket_name = self.bucket_name.clone();
 
-        self.client
-            .object()
-            .delete(&bucket_name, &location_copy)
-            .await
-            .context(UnableToDeleteData {
-                bucket: &self.bucket_name,
-                location: location.clone(),
-            })?;
+            self.client
+                .object()
+                .delete(&bucket_name, &location_copy)
+                .await
+                .context(UnableToDeleteData {
+                    bucket: &self.bucket_name,
+                    location: location.clone(),
+                })?;
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn list<'a>(
+    fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
-    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>>>> {
-        let converted_prefix = prefix.map(|p| p.to_raw());
-        let list_request = cloud_storage::ListRequest {
-            prefix: converted_prefix,
-            ..Default::default()
-        };
-        let object_lists = self
-            .client
-            .object()
-            .list(&self.bucket_name, list_request)
-            .await
-            .context(UnableToListData {
-                bucket: &self.bucket_name,
-            })?;
-
-        let bucket_name = self.bucket_name.clone();
-        let objects = object_lists
-            .map_ok(|list| {
-                list.items
-                    .into_iter()
-                    .map(|o| CloudPath::raw(o.name))
-                    .collect::<Vec<_>>()
-            })
-            .map_err(move |source| Error::UnableToStreamListData {
-                source,
-                bucket: bucket_name.clone(),
-            });
-
-        Ok(objects.boxed())
-    }
-
-    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        let converted_prefix = prefix.to_raw();
-        let list_request = cloud_storage::ListRequest {
-            prefix: Some(converted_prefix),
-            delimiter: Some(DELIMITER.to_string()),
-            ..Default::default()
-        };
-
-        let mut object_lists = Box::pin(
-            self.client
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>>>>> {
+        async move {
+            let converted_prefix = prefix.map(|p| p.to_raw());
+            let list_request = cloud_storage::ListRequest {
+                prefix: converted_prefix,
+                ..Default::default()
+            };
+            let object_lists = self
+                .client
                 .object()
                 .list(&self.bucket_name, list_request)
                 .await
                 .context(UnableToListData {
                     bucket: &self.bucket_name,
-                })?,
-        );
-
-        let result = match object_lists.next().await {
-            None => ListResult {
-                objects: vec![],
-                common_prefixes: vec![],
-                next_token: None,
-            },
-            Some(list_response) => {
-                let list_response = list_response.context(UnableToStreamListData {
-                    bucket: &self.bucket_name,
                 })?;
 
-                ListResult {
-                    objects: list_response
-                        .items
-                        .iter()
-                        .map(|object| {
-                            let location = CloudPath::raw(&object.name);
-                            let last_modified = object.updated;
-                            let size = usize::try_from(object.size)
-                                .expect("unsupported size on this platform");
+            let bucket_name = self.bucket_name.clone();
+            let objects = object_lists
+                .map_ok(|list| {
+                    list.items
+                        .into_iter()
+                        .map(|o| CloudPath::raw(o.name))
+                        .collect::<Vec<_>>()
+                })
+                .map_err(move |source| Error::UnableToStreamListData {
+                    source,
+                    bucket: bucket_name.clone(),
+                });
 
-                            ObjectMeta {
-                                location,
-                                last_modified,
-                                size,
-                            }
-                        })
-                        .collect(),
-                    common_prefixes: list_response.prefixes.iter().map(CloudPath::raw).collect(),
-                    next_token: list_response.next_page_token,
+            Ok(objects.boxed())
+        }
+        .boxed()
+    }
+
+    fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move {
+            let converted_prefix = prefix.to_raw();
+            let list_request = cloud_storage::ListRequest {
+                prefix: Some(converted_prefix),
+                delimiter: Some(DELIMITER.to_string()),
+                ..Default::default()
+            };
+
+            let mut object_lists = Box::pin(
+                self.client
+                    .object()
+                    .list(&self.bucket_name, list_request)
+                    .await
+                    .context(UnableToListData {
+                        bucket: &self.bucket_name,
+                    })?,
+            );
+
+            let result = match object_lists.next().await {
+                None => ListResult {
+                    objects: vec![],
+                    common_prefixes: vec![],
+                    next_token: None,
+                },
+                Some(list_response) => {
+                    let list_response = list_response.context(UnableToStreamListData {
+                        bucket: &self.bucket_name,
+                    })?;
+
+                    ListResult {
+                        objects: list_response
+                            .items
+                            .iter()
+                            .map(|object| {
+                                let location = CloudPath::raw(&object.name);
+                                let last_modified = object.updated;
+                                let size = usize::try_from(object.size)
+                                    .expect("unsupported size on this platform");
+
+                                ObjectMeta {
+                                    location,
+                                    last_modified,
+                                    size,
+                                }
+                            })
+                            .collect(),
+                        common_prefixes: list_response
+                            .prefixes
+                            .iter()
+                            .map(CloudPath::raw)
+                            .collect(),
+                        next_token: list_response.next_page_token,
+                    }
                 }
-            }
-        };
+            };
 
-        Ok(result)
+            Ok(result)
+        }
+        .boxed()
     }
 }
 

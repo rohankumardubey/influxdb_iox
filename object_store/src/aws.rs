@@ -4,12 +4,12 @@ use crate::{
     path::{cloud::CloudPath, DELIMITER},
     GetResult, ListResult, ObjectMeta, ObjectStoreApi, ObjectStorePath,
 };
-use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{
+    future::BoxFuture,
     stream::{self, BoxStream},
-    Future, StreamExt, TryStreamExt,
+    Future, FutureExt, StreamExt, TryStreamExt,
 };
 use hyper::client::Builder as HyperBuilder;
 use hyper_tls::HttpsConnector;
@@ -164,7 +164,6 @@ impl fmt::Debug for AmazonS3 {
     }
 }
 
-#[async_trait]
 impl ObjectStoreApi for AmazonS3 {
     type Path = CloudPath;
     type Error = Error;
@@ -177,183 +176,208 @@ impl ObjectStoreApi for AmazonS3 {
         CloudPath::raw(raw)
     }
 
-    async fn put(&self, location: &Self::Path, bytes: Bytes) -> Result<()> {
-        let bucket_name = self.bucket_name.clone();
-        let key = location.to_raw();
-        let request_factory = move || {
-            let bytes = bytes.clone();
+    fn put<'a>(
+        &'a self,
+        location: &'a Self::Path,
+        bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let bucket_name = self.bucket_name.clone();
+            let key = location.to_raw();
+            let request_factory = move || {
+                let bytes = bytes.clone();
 
-            let length = bytes.len();
-            let stream_data = std::io::Result::Ok(bytes);
-            let stream = futures::stream::once(async move { stream_data });
-            let byte_stream = ByteStream::new_with_size(stream, length);
+                let length = bytes.len();
+                let stream_data = std::io::Result::Ok(bytes);
+                let stream = futures::stream::once(async move { stream_data });
+                let byte_stream = ByteStream::new_with_size(stream, length);
 
-            rusoto_s3::PutObjectRequest {
-                bucket: bucket_name.clone(),
-                key: key.clone(),
-                body: Some(byte_stream),
-                ..Default::default()
-            }
-        };
+                rusoto_s3::PutObjectRequest {
+                    bucket: bucket_name.clone(),
+                    key: key.clone(),
+                    body: Some(byte_stream),
+                    ..Default::default()
+                }
+            };
 
-        let s3 = self.client().await;
+            let s3 = self.client().await;
 
-        s3_request(move || {
-            let (s3, request_factory) = (s3.clone(), request_factory.clone());
+            s3_request(move || {
+                let (s3, request_factory) = (s3.clone(), request_factory.clone());
 
-            async move { s3.put_object(request_factory()).await }
-        })
-        .await
-        .context(UnableToPutData {
-            bucket: &self.bucket_name,
-            location: location.to_raw(),
-        })?;
+                async move { s3.put_object(request_factory()).await }
+            })
+            .await
+            .context(UnableToPutData {
+                bucket: &self.bucket_name,
+                location: location.to_raw(),
+            })?;
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn get(&self, location: &Self::Path) -> Result<GetResult<Error>> {
-        let key = location.to_raw();
-        let get_request = rusoto_s3::GetObjectRequest {
-            bucket: self.bucket_name.clone(),
-            key: key.clone(),
-            ..Default::default()
-        };
-        let bucket_name = self.bucket_name.clone();
-        let s = self
-            .client()
-            .await
-            .get_object(get_request)
-            .await
-            .map_err(|e| match e {
-                rusoto_core::RusotoError::Service(rusoto_s3::GetObjectError::NoSuchKey(_)) => {
-                    Error::NotFound {
+    fn get<'a>(
+        &'a self,
+        location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move {
+            let key = location.to_raw();
+            let get_request = rusoto_s3::GetObjectRequest {
+                bucket: self.bucket_name.clone(),
+                key: key.clone(),
+                ..Default::default()
+            };
+            let bucket_name = self.bucket_name.clone();
+            let s = self
+                .client()
+                .await
+                .get_object(get_request)
+                .await
+                .map_err(|e| match e {
+                    rusoto_core::RusotoError::Service(rusoto_s3::GetObjectError::NoSuchKey(_)) => {
+                        Error::NotFound {
+                            location: key.clone(),
+                            source: e,
+                        }
+                    }
+                    _ => Error::UnableToGetData {
+                        bucket: self.bucket_name.to_owned(),
                         location: key.clone(),
                         source: e,
-                    }
-                }
-                _ => Error::UnableToGetData {
+                    },
+                })?
+                .body
+                .context(NoData {
                     bucket: self.bucket_name.to_owned(),
                     location: key.clone(),
-                    source: e,
-                },
-            })?
-            .body
-            .context(NoData {
-                bucket: self.bucket_name.to_owned(),
-                location: key.clone(),
-            })?
-            .map_err(move |source| Error::UnableToGetPieceOfData {
-                source,
+                })?
+                .map_err(move |source| Error::UnableToGetPieceOfData {
+                    source,
+                    bucket: bucket_name.clone(),
+                    location: key.clone(),
+                })
+                .err_into()
+                .boxed();
+
+            Ok(GetResult::Stream(s))
+        }
+        .boxed()
+    }
+
+    fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let key = location.to_raw();
+            let bucket_name = self.bucket_name.clone();
+
+            let request_factory = move || rusoto_s3::DeleteObjectRequest {
                 bucket: bucket_name.clone(),
-                location: key.clone(),
+                key: key.clone(),
+                ..Default::default()
+            };
+
+            let s3 = self.client().await;
+
+            s3_request(move || {
+                let (s3, request_factory) = (s3.clone(), request_factory.clone());
+
+                async move { s3.delete_object(request_factory()).await }
             })
-            .err_into()
-            .boxed();
+            .await
+            .context(UnableToDeleteData {
+                bucket: &self.bucket_name,
+                location: location.to_raw(),
+            })?;
 
-        Ok(GetResult::Stream(s))
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn delete(&self, location: &Self::Path) -> Result<()> {
-        let key = location.to_raw();
-        let bucket_name = self.bucket_name.clone();
-
-        let request_factory = move || rusoto_s3::DeleteObjectRequest {
-            bucket: bucket_name.clone(),
-            key: key.clone(),
-            ..Default::default()
-        };
-
-        let s3 = self.client().await;
-
-        s3_request(move || {
-            let (s3, request_factory) = (s3.clone(), request_factory.clone());
-
-            async move { s3.delete_object(request_factory()).await }
-        })
-        .await
-        .context(UnableToDeleteData {
-            bucket: &self.bucket_name,
-            location: location.to_raw(),
-        })?;
-
-        Ok(())
-    }
-
-    async fn list<'a>(
+    fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
-    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>>>> {
-        Ok(self
-            .list_objects_v2(prefix, None)
-            .await?
-            .map_ok(|list_objects_v2_result| {
-                let contents = list_objects_v2_result.contents.unwrap_or_default();
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>>>>> {
+        async move {
+            Ok(self
+                .list_objects_v2(prefix, None)
+                .await?
+                .map_ok(|list_objects_v2_result| {
+                    let contents = list_objects_v2_result.contents.unwrap_or_default();
 
-                contents
-                    .into_iter()
-                    .flat_map(|object| object.key.map(CloudPath::raw))
-                    .collect()
-            })
-            .boxed())
+                    contents
+                        .into_iter()
+                        .flat_map(|object| object.key.map(CloudPath::raw))
+                        .collect()
+                })
+                .boxed())
+        }
+        .boxed()
     }
 
-    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        Ok(self
-            .list_objects_v2(Some(prefix), Some(DELIMITER.to_string()))
-            .await?
-            .try_fold(
-                ListResult {
-                    next_token: None,
-                    common_prefixes: vec![],
-                    objects: vec![],
-                },
-                |acc, list_objects_v2_result| async move {
-                    let mut res = acc;
-                    let contents = list_objects_v2_result.contents.unwrap_or_default();
-                    let mut objects = contents
-                        .into_iter()
-                        .map(|object| {
-                            let location = CloudPath::raw(
-                                object.key.expect("object doesn't exist without a key"),
-                            );
-                            let last_modified = match object.last_modified {
-                                Some(lm) => DateTime::parse_from_rfc3339(&lm)
-                                    .context(UnableToParseLastModified {
-                                        bucket: &self.bucket_name,
-                                    })?
-                                    .with_timezone(&Utc),
-                                None => Utc::now(),
-                            };
-                            let size = usize::try_from(object.size.unwrap_or(0))
-                                .expect("unsupported size on this platform");
-
-                            Ok(ObjectMeta {
-                                location,
-                                last_modified,
-                                size,
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    res.objects.append(&mut objects);
-
-                    res.common_prefixes.extend(
-                        list_objects_v2_result
-                            .common_prefixes
-                            .unwrap_or_default()
+    fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move {
+            Ok(self
+                .list_objects_v2(Some(prefix), Some(DELIMITER.to_string()))
+                .await?
+                .try_fold(
+                    ListResult {
+                        next_token: None,
+                        common_prefixes: vec![],
+                        objects: vec![],
+                    },
+                    |acc, list_objects_v2_result| async move {
+                        let mut res = acc;
+                        let contents = list_objects_v2_result.contents.unwrap_or_default();
+                        let mut objects = contents
                             .into_iter()
-                            .map(|p| {
-                                CloudPath::raw(
-                                    p.prefix.expect("can't have a prefix without a value"),
-                                )
-                            }),
-                    );
+                            .map(|object| {
+                                let location = CloudPath::raw(
+                                    object.key.expect("object doesn't exist without a key"),
+                                );
+                                let last_modified = match object.last_modified {
+                                    Some(lm) => DateTime::parse_from_rfc3339(&lm)
+                                        .context(UnableToParseLastModified {
+                                            bucket: &self.bucket_name,
+                                        })?
+                                        .with_timezone(&Utc),
+                                    None => Utc::now(),
+                                };
+                                let size = usize::try_from(object.size.unwrap_or(0))
+                                    .expect("unsupported size on this platform");
 
-                    Ok(res)
-                },
-            )
-            .await?)
+                                Ok(ObjectMeta {
+                                    location,
+                                    last_modified,
+                                    size,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        res.objects.append(&mut objects);
+
+                        res.common_prefixes.extend(
+                            list_objects_v2_result
+                                .common_prefixes
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|p| {
+                                    CloudPath::raw(
+                                        p.prefix.expect("can't have a prefix without a value"),
+                                    )
+                                }),
+                        );
+
+                        Ok(res)
+                    },
+                )
+                .await?)
+        }
+        .boxed()
     }
 }
 

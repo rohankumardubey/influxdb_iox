@@ -4,7 +4,7 @@
 
 use crate::path::Path;
 use crate::ObjectStore;
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use snafu::Snafu;
 use std::sync::Arc;
 
@@ -20,7 +20,6 @@ pub enum Error {
 }
 
 /// Defines an LRU cache with local file locations for objects from object store.
-#[async_trait]
 pub trait Cache {
     /// Evicts an object from the local filesystem cache.
     fn evict(&self, path: &Path) -> Result<()>;
@@ -29,7 +28,11 @@ pub trait Cache {
     /// will get the object from object storage and write it to the local filesystem cache.
     /// If the cache is over its limit, it will evict other cached objects based on an LRU
     /// policy.
-    async fn fs_path_or_cache(&self, path: &Path, store: Arc<ObjectStore>) -> Result<&str>;
+    fn fs_path_or_cache<'a>(
+        &'a self,
+        path: &'a Path,
+        store: Arc<ObjectStore>,
+    ) -> BoxFuture<'a, Result<&str>>;
 
     /// The size in bytes of all files in the cache.
     fn size(&self) -> u64;
@@ -44,13 +47,16 @@ pub trait Cache {
 #[allow(missing_copy_implementations)]
 pub struct LocalFSCache {}
 
-#[async_trait]
 impl Cache for LocalFSCache {
     fn evict(&self, _path: &Path) -> Result<()> {
         todo!()
     }
 
-    async fn fs_path_or_cache(&self, _path: &Path, _store: Arc<ObjectStore>) -> Result<&str> {
+    fn fs_path_or_cache<'a>(
+        &'a self,
+        _path: &'a Path,
+        _store: Arc<ObjectStore>,
+    ) -> BoxFuture<'a, Result<&str>> {
         todo!()
     }
 

@@ -3,11 +3,11 @@
 use crate::cache::Cache;
 use crate::path::Path;
 use crate::{path::file::FilePath, GetResult, ListResult, ObjectMeta, ObjectStore, ObjectStoreApi};
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
+    future::BoxFuture,
     stream::{self, BoxStream},
-    StreamExt,
+    FutureExt, StreamExt,
 };
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::sync::Arc;
@@ -87,7 +87,6 @@ pub struct File {
     root: FilePath,
 }
 
-#[async_trait]
 impl ObjectStoreApi for File {
     type Path = FilePath;
     type Error = Error;
@@ -100,180 +99,203 @@ impl ObjectStoreApi for File {
         FilePath::raw(raw, true)
     }
 
-    async fn put(&self, location: &Self::Path, bytes: Bytes) -> Result<()> {
-        let content = bytes::BytesMut::from(&*bytes);
+    fn put<'a>(
+        &'a self,
+        location: &'a Self::Path,
+        bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let content = bytes::BytesMut::from(&*bytes);
 
-        let path = self.path(location);
+            let path = self.path(location);
 
-        let mut file = match fs::File::create(&path).await {
-            Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let parent = path
-                    .parent()
-                    .context(UnableToCreateFile { path: &path, err })?;
-                fs::create_dir_all(&parent)
-                    .await
-                    .context(UnableToCreateDir { path: parent })?;
+            let mut file = match fs::File::create(&path).await {
+                Ok(f) => f,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = path
+                        .parent()
+                        .context(UnableToCreateFile { path: &path, err })?;
+                    fs::create_dir_all(&parent)
+                        .await
+                        .context(UnableToCreateDir { path: parent })?;
 
-                match fs::File::create(&path).await {
-                    Ok(f) => f,
-                    Err(err) => return UnableToCreateFile { path, err }.fail(),
+                    match fs::File::create(&path).await {
+                        Ok(f) => f,
+                        Err(err) => return UnableToCreateFile { path, err }.fail(),
+                    }
                 }
-            }
-            Err(err) => return UnableToCreateFile { path, err }.fail(),
-        };
+                Err(err) => return UnableToCreateFile { path, err }.fail(),
+            };
 
-        tokio::io::copy(&mut &content[..], &mut file)
-            .await
-            .context(UnableToCopyDataToFile)?;
+            tokio::io::copy(&mut &content[..], &mut file)
+                .await
+                .context(UnableToCopyDataToFile)?;
 
-        Ok(())
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn get(&self, location: &Self::Path) -> Result<GetResult<Error>> {
-        let path = self.path(location);
+    fn get<'a>(
+        &'a self,
+        location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move {
+            let path = self.path(location);
 
-        let file = fs::File::open(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Error::NotFound {
-                    location: location.to_string(),
-                    source: e,
+            let file = fs::File::open(&path).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound {
+                        location: location.to_string(),
+                        source: e,
+                    }
+                } else {
+                    Error::UnableToOpenFile {
+                        path: path.clone(),
+                        source: e,
+                    }
                 }
-            } else {
-                Error::UnableToOpenFile {
-                    path: path.clone(),
-                    source: e,
-                }
-            }
-        })?;
+            })?;
 
-        Ok(GetResult::File(file, path))
+            Ok(GetResult::File(file, path))
+        }
+        .boxed()
     }
 
-    async fn delete(&self, location: &Self::Path) -> Result<()> {
-        let path = self.path(location);
-        fs::remove_file(&path)
-            .await
-            .context(UnableToDeleteFile { path })?;
-        Ok(())
+    fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let path = self.path(location);
+            fs::remove_file(&path)
+                .await
+                .context(UnableToDeleteFile { path })?;
+            Ok(())
+        }
+        .boxed()
     }
 
-    async fn list<'a>(
+    fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
-    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>>>> {
-        let root_path = self.root.to_path_buf();
-        let walkdir = WalkDir::new(&root_path)
-            // Don't include the root directory itself
-            .min_depth(1);
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>>>>> {
+        async move {
+            let root_path = self.root.to_path_buf();
+            let walkdir = WalkDir::new(&root_path)
+                // Don't include the root directory itself
+                .min_depth(1);
 
-        let s =
-            walkdir.into_iter().filter_map(move |result_dir_entry| {
-                match convert_walkdir_result(result_dir_entry) {
-                    Err(e) => Some(Err(e)),
-                    Ok(None) => None,
-                    Ok(entry @ Some(_)) => entry
-                        .filter(|dir_entry| dir_entry.file_type().is_file())
-                        .map(|file| {
-                            let relative_path = file.path().strip_prefix(&root_path).expect(
+            let s =
+                walkdir.into_iter().filter_map(
+                    move |result_dir_entry| match convert_walkdir_result(result_dir_entry) {
+                        Err(e) => Some(Err(e)),
+                        Ok(None) => None,
+                        Ok(entry @ Some(_)) => entry
+                            .filter(|dir_entry| dir_entry.file_type().is_file())
+                            .map(|file| {
+                                let relative_path = file.path().strip_prefix(&root_path).expect(
                                 "Must start with root path because this came from walking the root",
                             );
-                            FilePath::raw(relative_path, false)
-                        })
-                        .filter(|name| prefix.map_or(true, |p| name.prefix_matches(p)))
-                        .map(|name| Ok(vec![name])),
-                }
-            });
+                                FilePath::raw(relative_path, false)
+                            })
+                            .filter(|name| prefix.map_or(true, |p| name.prefix_matches(p)))
+                            .map(|name| Ok(vec![name])),
+                    },
+                );
 
-        Ok(stream::iter(s).boxed())
+            Ok(stream::iter(s).boxed())
+        }
+        .boxed()
     }
 
-    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        // Always treat prefix as relative because the list operations don't know
-        // anything about where on disk the root of this object store is; they
-        // only care about what's within this object store's directory. See
-        // documentation for `push_path`: it deliberately does *not* behave  as
-        // `PathBuf::push` does: there is no way to replace the root. So even if
-        // `prefix` isn't relative, we treat it as such here.
-        let mut resolved_prefix = self.root.clone();
-        resolved_prefix.push_path(prefix);
+    fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move {
+            // Always treat prefix as relative because the list operations don't know
+            // anything about where on disk the root of this object store is; they
+            // only care about what's within this object store's directory. See
+            // documentation for `push_path`: it deliberately does *not* behave  as
+            // `PathBuf::push` does: there is no way to replace the root. So even if
+            // `prefix` isn't relative, we treat it as such here.
+            let mut resolved_prefix = self.root.clone();
+            resolved_prefix.push_path(prefix);
 
-        // It is valid to specify a prefix with directories `[foo, bar]` and filename
-        // `baz`, in which case we want to treat it like a glob for
-        // `foo/bar/baz*` and there may not actually be a file or directory
-        // named `foo/bar/baz`. We want to look at all the entries in
-        // `foo/bar/`, so remove the file name.
-        let mut search_path = resolved_prefix.clone();
-        search_path.unset_file_name();
+            // It is valid to specify a prefix with directories `[foo, bar]` and filename
+            // `baz`, in which case we want to treat it like a glob for
+            // `foo/bar/baz*` and there may not actually be a file or directory
+            // named `foo/bar/baz`. We want to look at all the entries in
+            // `foo/bar/`, so remove the file name.
+            let mut search_path = resolved_prefix.clone();
+            search_path.unset_file_name();
 
-        let walkdir = WalkDir::new(&search_path.to_path_buf())
-            .min_depth(1)
-            .max_depth(1);
+            let walkdir = WalkDir::new(&search_path.to_path_buf())
+                .min_depth(1)
+                .max_depth(1);
 
-        let mut common_prefixes = BTreeSet::new();
-        let mut objects = Vec::new();
+            let mut common_prefixes = BTreeSet::new();
+            let mut objects = Vec::new();
 
-        let root_path = self.root.to_path_buf();
-        for entry_res in walkdir.into_iter().map(convert_walkdir_result) {
-            if let Some(entry) = entry_res? {
-                let entry_location = FilePath::raw(entry.path(), false);
+            let root_path = self.root.to_path_buf();
+            for entry_res in walkdir.into_iter().map(convert_walkdir_result) {
+                if let Some(entry) = entry_res? {
+                    let entry_location = FilePath::raw(entry.path(), false);
 
-                if entry_location.prefix_matches(&resolved_prefix) {
-                    let metadata = entry
-                        .metadata()
-                        .context(UnableToAccessMetadata { path: entry.path() })?;
+                    if entry_location.prefix_matches(&resolved_prefix) {
+                        let metadata = entry
+                            .metadata()
+                            .context(UnableToAccessMetadata { path: entry.path() })?;
 
-                    if metadata.is_dir() {
-                        let parts = entry_location
-                            .parts_after_prefix(&resolved_prefix)
-                            .expect("must have prefix because of the if prefix_matches condition");
+                        if metadata.is_dir() {
+                            let parts = entry_location.parts_after_prefix(&resolved_prefix).expect(
+                                "must have prefix because of the if prefix_matches condition",
+                            );
 
-                        let mut relative_location = prefix.to_owned();
-                        relative_location.push_part_as_dir(&parts[0]);
-                        common_prefixes.insert(relative_location);
-                    } else {
-                        let path = entry
-                            .path()
-                            .strip_prefix(&root_path)
-                            .expect("must have prefix because of the if prefix_matches condition");
-                        let location = FilePath::raw(path, false);
+                            let mut relative_location = prefix.to_owned();
+                            relative_location.push_part_as_dir(&parts[0]);
+                            common_prefixes.insert(relative_location);
+                        } else {
+                            let path = entry.path().strip_prefix(&root_path).expect(
+                                "must have prefix because of the if prefix_matches condition",
+                            );
+                            let location = FilePath::raw(path, false);
 
-                        let last_modified = metadata
-                            .modified()
-                            .expect("Modified file time should be supported on this platform")
-                            .into();
-                        let size = usize::try_from(metadata.len())
-                            .context(FileSizeOverflowedUsize { path: entry.path() })?;
+                            let last_modified = metadata
+                                .modified()
+                                .expect("Modified file time should be supported on this platform")
+                                .into();
+                            let size = usize::try_from(metadata.len())
+                                .context(FileSizeOverflowedUsize { path: entry.path() })?;
 
-                        objects.push(ObjectMeta {
-                            location,
-                            last_modified,
-                            size,
-                        });
+                            objects.push(ObjectMeta {
+                                location,
+                                last_modified,
+                                size,
+                            });
+                        }
                     }
                 }
             }
-        }
 
-        Ok(ListResult {
-            next_token: None,
-            common_prefixes: common_prefixes.into_iter().collect(),
-            objects,
-        })
+            Ok(ListResult {
+                next_token: None,
+                common_prefixes: common_prefixes.into_iter().collect(),
+                objects,
+            })
+        }
+        .boxed()
     }
 }
 
-#[async_trait]
 impl Cache for File {
     fn evict(&self, _path: &Path) -> crate::cache::Result<()> {
         todo!()
     }
 
-    async fn fs_path_or_cache(
+    fn fs_path_or_cache(
         &self,
         _path: &Path,
         _store: Arc<ObjectStore>,
-    ) -> crate::cache::Result<&str> {
+    ) -> BoxFuture<'_, crate::cache::Result<&str>> {
         todo!()
     }
 

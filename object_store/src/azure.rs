@@ -4,7 +4,6 @@ use crate::{
     path::{cloud::CloudPath, DELIMITER},
     GetResult, ListResult, ObjectMeta, ObjectStoreApi, ObjectStorePath,
 };
-use async_trait::async_trait;
 use azure_core::prelude::*;
 use azure_storage::{
     blob::prelude::{AsBlobClient, AsContainerClient, ContainerClient},
@@ -13,6 +12,7 @@ use azure_storage::{
 };
 use bytes::Bytes;
 use futures::{
+    future::BoxFuture,
     stream::{self, BoxStream},
     FutureExt, StreamExt,
 };
@@ -58,7 +58,6 @@ pub struct MicrosoftAzure {
     container_name: String,
 }
 
-#[async_trait]
 impl ObjectStoreApi for MicrosoftAzure {
     type Path = CloudPath;
     type Error = Error;
@@ -71,159 +70,184 @@ impl ObjectStoreApi for MicrosoftAzure {
         CloudPath::raw(raw)
     }
 
-    async fn put(&self, location: &Self::Path, bytes: Bytes) -> Result<()> {
-        let location = location.to_raw();
+    fn put<'a>(
+        &'a self,
+        location: &'a Self::Path,
+        bytes: Bytes,
+    ) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let location = location.to_raw();
 
-        let bytes = bytes::BytesMut::from(&*bytes);
+            let bytes = bytes::BytesMut::from(&*bytes);
 
-        self.container_client
-            .as_blob_client(&location)
-            .put_block_blob(bytes)
-            .execute()
-            .await
-            .context(Put {
-                location: location.to_owned(),
-            })?;
-
-        Ok(())
-    }
-
-    async fn get(&self, location: &Self::Path) -> Result<GetResult<Error>> {
-        let container_client = Arc::clone(&self.container_client);
-        let location = location.to_raw();
-        let s = async move {
-            container_client
+            self.container_client
                 .as_blob_client(&location)
-                .get()
+                .put_block_blob(bytes)
                 .execute()
                 .await
-                .map(|blob| blob.data)
-                .context(Get {
+                .context(Put {
                     location: location.to_owned(),
-                })
+                })?;
+
+            Ok(())
         }
-        .into_stream()
-        .boxed();
-
-        Ok(GetResult::Stream(s))
+        .boxed()
     }
 
-    async fn delete(&self, location: &Self::Path) -> Result<()> {
-        let location = location.to_raw();
-        self.container_client
-            .as_blob_client(&location)
-            .delete()
-            .delete_snapshots_method(DeleteSnapshotsMethod::Include)
-            .execute()
-            .await
-            .context(Delete {
-                location: location.to_owned(),
-            })?;
+    fn get<'a>(
+        &'a self,
+        location: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<GetResult<Self::Error>, Self::Error>> {
+        async move {
+            let container_client = Arc::clone(&self.container_client);
+            let location = location.to_raw();
+            let s = async move {
+                container_client
+                    .as_blob_client(&location)
+                    .get()
+                    .execute()
+                    .await
+                    .map(|blob| blob.data)
+                    .context(Get {
+                        location: location.to_owned(),
+                    })
+            }
+            .into_stream()
+            .boxed();
 
-        Ok(())
+            Ok(GetResult::Stream(s))
+        }
+        .boxed()
     }
 
-    async fn list<'a>(
+    fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>> {
+        async move {
+            let location = location.to_raw();
+            self.container_client
+                .as_blob_client(&location)
+                .delete()
+                .delete_snapshots_method(DeleteSnapshotsMethod::Include)
+                .execute()
+                .await
+                .context(Delete {
+                    location: location.to_owned(),
+                })?;
+
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
-    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>>>> {
-        #[derive(Clone)]
-        enum ListState {
-            Start,
-            HasMore(String),
-            Done,
-        }
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<Vec<Self::Path>>>>> {
+        async move {
+            #[derive(Clone)]
+            enum ListState {
+                Start,
+                HasMore(String),
+                Done,
+            }
 
-        Ok(stream::unfold(ListState::Start, move |state| async move {
+            Ok(stream::unfold(ListState::Start, move |state| async move {
+                let mut request = self.container_client.list_blobs();
+
+                let prefix = prefix.map(|p| p.to_raw());
+                if let Some(ref p) = prefix {
+                    request = request.prefix(p as &str);
+                }
+
+                match state {
+                    ListState::HasMore(ref marker) => {
+                        request = request.next_marker(marker as &str);
+                    }
+                    ListState::Done => {
+                        return None;
+                    }
+                    ListState::Start => {}
+                }
+
+                let resp = match request.execute().await.context(List) {
+                    Ok(resp) => resp,
+                    Err(err) => return Some((Err(err), state)),
+                };
+
+                let next_state = if let Some(marker) = resp.next_marker {
+                    ListState::HasMore(marker.as_str().to_string())
+                } else {
+                    ListState::Done
+                };
+
+                let names = resp
+                    .blobs
+                    .blobs
+                    .into_iter()
+                    .map(|blob| CloudPath::raw(blob.name))
+                    .collect();
+
+                Some((Ok(names), next_state))
+            })
+            .boxed())
+        }
+        .boxed()
+    }
+
+    fn list_with_delimiter<'a>(
+        &'a self,
+        prefix: &'a Self::Path,
+    ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
+        async move {
             let mut request = self.container_client.list_blobs();
 
-            let prefix = prefix.map(|p| p.to_raw());
-            if let Some(ref p) = prefix {
-                request = request.prefix(p as &str);
-            }
+            let prefix = prefix.to_raw();
 
-            match state {
-                ListState::HasMore(ref marker) => {
-                    request = request.next_marker(marker as &str);
-                }
-                ListState::Done => {
-                    return None;
-                }
-                ListState::Start => {}
-            }
+            request = request.delimiter(Delimiter::new(DELIMITER));
+            request = request.prefix(&*prefix);
 
-            let resp = match request.execute().await.context(List) {
-                Ok(resp) => resp,
-                Err(err) => return Some((Err(err), state)),
-            };
+            let resp = request.execute().await.context(List)?;
 
-            let next_state = if let Some(marker) = resp.next_marker {
-                ListState::HasMore(marker.as_str().to_string())
-            } else {
-                ListState::Done
-            };
+            let next_token = resp.next_marker.as_ref().map(|m| m.as_str().to_string());
 
-            let names = resp
+            let common_prefixes = resp
+                .blobs
+                .blob_prefix
+                .map(|prefixes| {
+                    prefixes
+                        .iter()
+                        .map(|prefix| CloudPath::raw(&prefix.name))
+                        .collect()
+                })
+                .unwrap_or_else(Vec::new);
+
+            let objects = resp
                 .blobs
                 .blobs
                 .into_iter()
-                .map(|blob| CloudPath::raw(blob.name))
+                .map(|blob| {
+                    let location = CloudPath::raw(blob.name);
+                    let last_modified = blob.properties.last_modified;
+                    let size = blob
+                        .properties
+                        .content_length
+                        .try_into()
+                        .expect("unsupported size on this platform");
+
+                    ObjectMeta {
+                        location,
+                        last_modified,
+                        size,
+                    }
+                })
                 .collect();
 
-            Some((Ok(names), next_state))
-        })
-        .boxed())
-    }
-
-    async fn list_with_delimiter(&self, prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
-        let mut request = self.container_client.list_blobs();
-
-        let prefix = prefix.to_raw();
-
-        request = request.delimiter(Delimiter::new(DELIMITER));
-        request = request.prefix(&*prefix);
-
-        let resp = request.execute().await.context(List)?;
-
-        let next_token = resp.next_marker.as_ref().map(|m| m.as_str().to_string());
-
-        let common_prefixes = resp
-            .blobs
-            .blob_prefix
-            .map(|prefixes| {
-                prefixes
-                    .iter()
-                    .map(|prefix| CloudPath::raw(&prefix.name))
-                    .collect()
+            Ok(ListResult {
+                next_token,
+                common_prefixes,
+                objects,
             })
-            .unwrap_or_else(Vec::new);
-
-        let objects = resp
-            .blobs
-            .blobs
-            .into_iter()
-            .map(|blob| {
-                let location = CloudPath::raw(blob.name);
-                let last_modified = blob.properties.last_modified;
-                let size = blob
-                    .properties
-                    .content_length
-                    .try_into()
-                    .expect("unsupported size on this platform");
-
-                ObjectMeta {
-                    location,
-                    last_modified,
-                    size,
-                }
-            })
-            .collect();
-
-        Ok(ListResult {
-            next_token,
-            common_prefixes,
-            objects,
-        })
+        }
+        .boxed()
     }
 }
 
