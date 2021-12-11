@@ -781,7 +781,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "6.0.0"
-source = "git+https://github.com/apache/arrow-datafusion.git?rev=0338b7336d257bdbdc5eefceda5846e3a5b31409#0338b7336d257bdbdc5eefceda5846e3a5b31409"
+source = "git+https://github.com/apache/arrow-datafusion.git?rev=b17e1b2b60618ba82818846ab079a916248b8c4f#b17e1b2b60618ba82818846ab079a916248b8c4f"
 dependencies = [
  "ahash",
  "arrow",
@@ -4021,9 +4021,9 @@ dependencies = [
 
 [[package]]
 name = "sqlparser"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760e624412a15d5838ae04fad01037beeff1047781431d74360cddd6b3c1c784"
+checksum = "b9907f54bd0f7b6ce72c2be1e570a614819ee08e3deb66d90480df341d8a12a8"
 dependencies = [
  "log",
 ]
