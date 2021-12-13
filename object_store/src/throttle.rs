@@ -176,6 +176,7 @@ impl<T: ObjectStoreApi> ObjectStoreApi for ThrottledStore<T> {
         .boxed()
     }
 
+    #[allow(clippy::type_complexity)]
     fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,

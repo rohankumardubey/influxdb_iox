@@ -56,6 +56,7 @@ struct IOxQueryPlanner {}
 impl QueryPlanner for IOxQueryPlanner {
     /// Given a `LogicalPlan` created from above, create an
     /// `ExecutionPlan` suitable for execution
+    #[allow(clippy::type_complexity)]
     fn create_physical_plan<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
         logical_plan: &'life1 LogicalPlan,

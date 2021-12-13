@@ -225,6 +225,7 @@ impl<C: QueryChunk + 'static> TableProvider for ChunkTableProvider<C> {
         self.arrow_schema()
     }
 
+    #[allow(clippy::type_complexity)]
     fn scan<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
         projection: &'life1 Option<Vec<usize>>,

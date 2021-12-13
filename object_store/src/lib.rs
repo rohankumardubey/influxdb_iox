@@ -94,6 +94,7 @@ pub trait ObjectStoreApi: Send + Sync + 'static {
     fn delete<'a>(&'a self, location: &'a Self::Path) -> BoxFuture<'a, Result<(), Self::Error>>;
 
     /// List all the objects with the given prefix.
+    #[allow(clippy::type_complexity)]
     fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
@@ -345,6 +346,7 @@ impl ObjectStoreApi for ObjectStore {
         .boxed()
     }
 
+    #[allow(clippy::type_complexity)]
     fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,

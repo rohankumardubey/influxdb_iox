@@ -65,6 +65,7 @@ impl ObjectStoreApi for DummyObjectStore {
         async move { NotSupported { name: &self.name }.fail() }.boxed()
     }
 
+    #[allow(clippy::type_complexity)]
     fn list<'a>(
         &'a self,
         _prefix: Option<&'a Self::Path>,

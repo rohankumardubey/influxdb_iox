@@ -295,6 +295,7 @@ impl ObjectStoreApi for AmazonS3 {
         .boxed()
     }
 
+    #[allow(clippy::type_complexity)]
     fn list<'a>(
         &'a self,
         prefix: Option<&'a Self::Path>,
