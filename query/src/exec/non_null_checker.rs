@@ -36,14 +36,6 @@
 //!
 //! This operation can be used to implement the table_name metadata query
 
-use std::{
-    any::Any,
-    fmt::{self, Debug},
-    sync::Arc,
-};
-
-use async_trait::async_trait;
-
 use arrow::{
     array::{new_empty_array, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -59,9 +51,14 @@ use datafusion::{
         Statistics,
     },
 };
-
 use datafusion_util::AdapterStream;
+use futures::FutureExt;
 use observability_deps::tracing::debug;
+use std::{
+    any::Any,
+    fmt::{self, Debug},
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -193,7 +190,6 @@ impl Debug for NonNullCheckerExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for NonNullCheckerExec {
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
@@ -240,58 +236,74 @@ impl ExecutionPlan for NonNullCheckerExec {
     }
 
     /// Execute one partition and return an iterator over RecordBatch
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-        if self.output_partitioning().partition_count() <= partition {
-            return Err(Error::Internal(format!(
-                "NonNullCheckerExec invalid partition {}",
-                partition
-            )));
-        }
-
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let input_stream = self.input.execute(partition).await?;
-
-        let (tx, rx) = mpsc::channel(1);
-
-        let task = tokio::task::spawn(check_for_nulls(
-            input_stream,
-            Arc::clone(&self.schema),
-            baseline_metrics,
-            Arc::clone(&self.value),
-            tx.clone(),
-        ));
-
-        // A second task watches the output of the worker task (TODO refactor into datafusion_util)
-        tokio::task::spawn(async move {
-            let task_result = task.await;
-
-            let msg = match task_result {
-                Err(join_err) => {
-                    debug!(e=%join_err, "Error joining null_check task");
-                    Some(ArrowError::ExternalError(Box::new(join_err)))
-                }
-                Ok(Err(e)) => {
-                    debug!(%e, "Error in null_check task itself");
-                    Some(e)
-                }
-                Ok(Ok(())) => {
-                    // successful
-                    None
-                }
-            };
-
-            if let Some(e) = msg {
-                // try and tell the receiver something went
-                // wrong. Note we ignore errors sending this message
-                // as that means the receiver has already been
-                // shutdown and no one cares anymore lol
-                if tx.send(Err(e)).await.is_err() {
-                    debug!("null_check receiver hung up");
-                }
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        partition: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<SendableRecordBatchStream>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            if self.output_partitioning().partition_count() <= partition {
+                return Err(Error::Internal(format!(
+                    "NonNullCheckerExec invalid partition {}",
+                    partition
+                )));
             }
-        });
 
-        Ok(AdapterStream::adapt(self.schema(), rx))
+            let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+            let input_stream = self.input.execute(partition).await?;
+
+            let (tx, rx) = mpsc::channel(1);
+
+            let task = tokio::task::spawn(check_for_nulls(
+                input_stream,
+                Arc::clone(&self.schema),
+                baseline_metrics,
+                Arc::clone(&self.value),
+                tx.clone(),
+            ));
+
+            // A second task watches the output of the worker task (TODO refactor into datafusion_util)
+            tokio::task::spawn(async move {
+                let task_result = task.await;
+
+                let msg = match task_result {
+                    Err(join_err) => {
+                        debug!(e=%join_err, "Error joining null_check task");
+                        Some(ArrowError::ExternalError(Box::new(join_err)))
+                    }
+                    Ok(Err(e)) => {
+                        debug!(%e, "Error in null_check task itself");
+                        Some(e)
+                    }
+                    Ok(Ok(())) => {
+                        // successful
+                        None
+                    }
+                };
+
+                if let Some(e) = msg {
+                    // try and tell the receiver something went
+                    // wrong. Note we ignore errors sending this message
+                    // as that means the receiver has already been
+                    // shutdown and no one cares anymore lol
+                    if tx.send(Err(e)).await.is_err() {
+                        debug!("null_check receiver hung up");
+                    }
+                }
+            });
+
+            Ok(AdapterStream::adapt(self.schema(), rx))
+        }
+        .boxed()
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {

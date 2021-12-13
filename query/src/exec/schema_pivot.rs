@@ -19,14 +19,6 @@
 //!
 //! This operation can be used to implement the tag_keys metadata query
 
-use std::{
-    any::Any,
-    fmt::{self, Debug},
-    sync::Arc,
-};
-
-use async_trait::async_trait;
-
 use arrow::{
     array::StringBuilder,
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -42,7 +34,12 @@ use datafusion::{
         Statistics,
     },
 };
-
+use futures::FutureExt;
+use std::{
+    any::Any,
+    fmt::{self, Debug},
+    sync::Arc,
+};
 use tokio_stream::StreamExt;
 
 /// Implements the SchemaPivot operation described in `make_schema_pivot`
@@ -161,7 +158,6 @@ impl Debug for SchemaPivotExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for SchemaPivotExec {
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
@@ -207,95 +203,109 @@ impl ExecutionPlan for SchemaPivotExec {
     }
 
     /// Execute one partition and return an iterator over RecordBatch
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-        if self.output_partitioning().partition_count() <= partition {
-            return Err(Error::Internal(format!(
-                "SchemaPivotExec invalid partition {}",
-                partition
-            )));
-        }
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        partition: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<SendableRecordBatchStream>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            if self.output_partitioning().partition_count() <= partition {
+                return Err(Error::Internal(format!(
+                    "SchemaPivotExec invalid partition {}",
+                    partition
+                )));
+            }
 
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let mut input_reader = self.input.execute(partition).await?;
+            let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+            let mut input_reader = self.input.execute(partition).await?;
 
-        // Algorithm: for each column we haven't seen a value for yet,
-        // check each input row;
-        //
-        // Performance Optimizations: Don't continue scaning columns
-        // if we have already seen a non-null value, and stop early we
-        // have seen values for all columns.
-        //
-        // this code should be streaming (aka not run directly in
-        // `execute`):
-        // https://github.com/influxdata/influxdb_iox/issues/2386
-        let input_schema = self.input.schema();
-        let input_fields = input_schema.fields();
-        let num_fields = input_fields.len();
-        let mut field_indexes_with_seen_values = vec![false; num_fields];
-        let mut num_fields_seen_with_values = 0;
+            // Algorithm: for each column we haven't seen a value for yet,
+            // check each input row;
+            //
+            // Performance Optimizations: Don't continue scaning columns
+            // if we have already seen a non-null value, and stop early we
+            // have seen values for all columns.
+            //
+            // this code should be streaming (aka not run directly in
+            // `execute`):
+            // https://github.com/influxdata/influxdb_iox/issues/2386
+            let input_schema = self.input.schema();
+            let input_fields = input_schema.fields();
+            let num_fields = input_fields.len();
+            let mut field_indexes_with_seen_values = vec![false; num_fields];
+            let mut num_fields_seen_with_values = 0;
 
-        // use a loop so that we release the mutex once we have read each input_batch
-        let mut keep_searching = true;
-        while keep_searching {
-            let input_batch = input_reader.next().await.transpose()?;
-            let timer = baseline_metrics.elapsed_compute().timer();
+            // use a loop so that we release the mutex once we have read each input_batch
+            let mut keep_searching = true;
+            while keep_searching {
+                let input_batch = input_reader.next().await.transpose()?;
+                let timer = baseline_metrics.elapsed_compute().timer();
 
-            keep_searching = match input_batch {
-                Some(input_batch) => {
-                    let num_rows = input_batch.num_rows();
+                keep_searching = match input_batch {
+                    Some(input_batch) => {
+                        let num_rows = input_batch.num_rows();
 
-                    for (i, seen_value) in field_indexes_with_seen_values.iter_mut().enumerate() {
-                        // only check fields we haven't seen values for
-                        if !*seen_value {
-                            let column = input_batch.column(i);
+                        for (i, seen_value) in field_indexes_with_seen_values.iter_mut().enumerate()
+                        {
+                            // only check fields we haven't seen values for
+                            if !*seen_value {
+                                let column = input_batch.column(i);
 
-                            let field_has_values =
-                                !column.is_empty() && column.null_count() < num_rows;
+                                let field_has_values =
+                                    !column.is_empty() && column.null_count() < num_rows;
 
-                            if field_has_values {
-                                *seen_value = true;
-                                num_fields_seen_with_values += 1;
+                                if field_has_values {
+                                    *seen_value = true;
+                                    num_fields_seen_with_values += 1;
+                                }
                             }
                         }
+                        // need to keep searching if there are still some
+                        // fields without values
+                        num_fields_seen_with_values < num_fields
                     }
-                    // need to keep searching if there are still some
-                    // fields without values
-                    num_fields_seen_with_values < num_fields
-                }
-                // no more input
-                None => false,
-            };
-            timer.done();
+                    // no more input
+                    None => false,
+                };
+                timer.done();
+            }
+
+            // now, output a string for each column in the input schema
+            // that we saw values for
+            let mut column_name_builder = StringBuilder::new(num_fields);
+            field_indexes_with_seen_values
+                .iter()
+                .enumerate()
+                .filter_map(|(field_index, has_values)| {
+                    if *has_values {
+                        Some(input_fields[field_index].name())
+                    } else {
+                        None
+                    }
+                })
+                .try_for_each(|field_name| {
+                    column_name_builder
+                        .append_value(field_name)
+                        .map_err(Error::ArrowError)
+                })?;
+
+            let batch =
+                RecordBatch::try_new(self.schema(), vec![Arc::new(column_name_builder.finish())])
+                    .record_output(&baseline_metrics)?;
+
+            let batches = vec![Arc::new(batch)];
+            Ok(Box::pin(SizedRecordBatchStream::new(self.schema(), batches)) as _)
         }
-
-        // now, output a string for each column in the input schema
-        // that we saw values for
-        let mut column_name_builder = StringBuilder::new(num_fields);
-        field_indexes_with_seen_values
-            .iter()
-            .enumerate()
-            .filter_map(|(field_index, has_values)| {
-                if *has_values {
-                    Some(input_fields[field_index].name())
-                } else {
-                    None
-                }
-            })
-            .try_for_each(|field_name| {
-                column_name_builder
-                    .append_value(field_name)
-                    .map_err(Error::ArrowError)
-            })?;
-
-        let batch =
-            RecordBatch::try_new(self.schema(), vec![Arc::new(column_name_builder.finish())])
-                .record_output(&baseline_metrics)?;
-
-        let batches = vec![Arc::new(batch)];
-        Ok(Box::pin(SizedRecordBatchStream::new(
-            self.schema(),
-            batches,
-        )))
+        .boxed()
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {

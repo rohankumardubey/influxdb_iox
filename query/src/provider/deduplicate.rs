@@ -2,16 +2,11 @@
 mod algo;
 mod key_ranges;
 
-use std::{fmt, sync::Arc};
-
+use self::algo::RecordBatchDeduplicator;
 use arrow::{
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
-use datafusion_util::AdapterStream;
-
-use self::algo::RecordBatchDeduplicator;
 use datafusion::{
     error::{DataFusionError, Result},
     physical_plan::{
@@ -23,8 +18,10 @@ use datafusion::{
         Statistics,
     },
 };
-use futures::StreamExt;
+use datafusion_util::AdapterStream;
+use futures::{FutureExt, StreamExt};
 use observability_deps::tracing::debug;
+use std::{fmt, sync::Arc};
 use tokio::sync::mpsc;
 
 /// # DeduplicateExec
@@ -139,7 +136,6 @@ impl DeduplicateMetrics {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for DeduplicateExec {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -166,58 +162,74 @@ impl ExecutionPlan for DeduplicateExec {
         Ok(Arc::new(Self::new(input, self.sort_keys.clone())))
     }
 
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(
-                "DeduplicateExec only supports a single input stream".to_string(),
-            ));
-        }
-        let deduplicate_metrics = DeduplicateMetrics::new(&self.metrics, partition);
-
-        let input_stream = self.input.execute(0).await?;
-
-        // the deduplication is performed in a separate task which is
-        // then sent via a channel to the output
-        let (tx, rx) = mpsc::channel(1);
-
-        let task = tokio::task::spawn(deduplicate(
-            input_stream,
-            self.sort_keys.clone(),
-            tx.clone(),
-            deduplicate_metrics,
-        ));
-
-        // A second task watches the output of the worker task
-        tokio::task::spawn(async move {
-            let task_result = task.await;
-
-            let msg = match task_result {
-                Err(join_err) => {
-                    debug!(e=%join_err, "Error joining deduplicate task");
-                    Some(ArrowError::ExternalError(Box::new(join_err)))
-                }
-                Ok(Err(e)) => {
-                    debug!(%e, "Error in deduplicate task itself");
-                    Some(e)
-                }
-                Ok(Ok(())) => {
-                    // successful
-                    None
-                }
-            };
-
-            if let Some(e) = msg {
-                // try and tell the receiver something went
-                // wrong. Note we ignore errors sending this message
-                // as that means the receiver has already been
-                // shutdown and no one cares anymore lol
-                if tx.send(Err(e)).await.is_err() {
-                    debug!("deduplicate receiver hung up");
-                }
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        partition: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<SendableRecordBatchStream>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            if partition != 0 {
+                return Err(DataFusionError::Internal(
+                    "DeduplicateExec only supports a single input stream".to_string(),
+                ));
             }
-        });
+            let deduplicate_metrics = DeduplicateMetrics::new(&self.metrics, partition);
 
-        Ok(AdapterStream::adapt(self.schema(), rx))
+            let input_stream = self.input.execute(0).await?;
+
+            // the deduplication is performed in a separate task which is
+            // then sent via a channel to the output
+            let (tx, rx) = mpsc::channel(1);
+
+            let task = tokio::task::spawn(deduplicate(
+                input_stream,
+                self.sort_keys.clone(),
+                tx.clone(),
+                deduplicate_metrics,
+            ));
+
+            // A second task watches the output of the worker task
+            tokio::task::spawn(async move {
+                let task_result = task.await;
+
+                let msg = match task_result {
+                    Err(join_err) => {
+                        debug!(e=%join_err, "Error joining deduplicate task");
+                        Some(ArrowError::ExternalError(Box::new(join_err)))
+                    }
+                    Ok(Err(e)) => {
+                        debug!(%e, "Error in deduplicate task itself");
+                        Some(e)
+                    }
+                    Ok(Ok(())) => {
+                        // successful
+                        None
+                    }
+                };
+
+                if let Some(e) = msg {
+                    // try and tell the receiver something went
+                    // wrong. Note we ignore errors sending this message
+                    // as that means the receiver has already been
+                    // shutdown and no one cares anymore lol
+                    if tx.send(Err(e)).await.is_err() {
+                        debug!("deduplicate receiver hung up");
+                    }
+                }
+            });
+
+            Ok(AdapterStream::adapt(self.schema(), rx))
+        }
+        .boxed()
     }
 
     fn required_child_distribution(&self) -> Distribution {
@@ -974,7 +986,6 @@ mod test {
         batches: Vec<ArrowResult<RecordBatch>>,
     }
 
-    #[async_trait]
     impl ExecutionPlan for DummyExec {
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -999,21 +1010,37 @@ mod test {
             unimplemented!()
         }
 
-        async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-            assert_eq!(partition, 0);
+        fn execute<'life0, 'async_trait>(
+            &'life0 self,
+            partition: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<SendableRecordBatchStream>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            async move {
+                assert_eq!(partition, 0);
 
-            // ensure there is space to queue up the channel
-            let (tx, rx) = mpsc::channel(self.batches.len());
+                // ensure there is space to queue up the channel
+                let (tx, rx) = mpsc::channel(self.batches.len());
 
-            // queue up all the results
-            for r in &self.batches {
-                match r {
-                    Ok(batch) => tx.send(Ok(batch.clone())).await.unwrap(),
-                    Err(e) => tx.send(Err(clone_error(e))).await.unwrap(),
+                // queue up all the results
+                for r in &self.batches {
+                    match r {
+                        Ok(batch) => tx.send(Ok(batch.clone())).await.unwrap(),
+                        Err(e) => tx.send(Err(clone_error(e))).await.unwrap(),
+                    }
                 }
-            }
 
-            Ok(AdapterStream::adapt(self.schema(), rx))
+                Ok(AdapterStream::adapt(self.schema(), rx))
+            }
+            .boxed()
         }
 
         fn statistics(&self) -> Statistics {

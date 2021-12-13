@@ -1,13 +1,5 @@
 //! This module contains a DataFusion extension node to "split" schemas
 
-use std::{
-    any::Any,
-    fmt::{self, Debug},
-    sync::Arc,
-};
-
-use async_trait::async_trait;
-
 use arrow::{
     array::{Array, ArrayRef, BooleanArray},
     compute::{self, filter_record_batch},
@@ -25,10 +17,14 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-
 use datafusion_util::AdapterStream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use observability_deps::tracing::{debug, trace};
+use std::{
+    any::Any,
+    fmt::{self, Debug},
+    sync::Arc,
+};
 use tokio::sync::{mpsc::Sender, Mutex};
 
 /// Implements stream splitting described in `make_stream_split`
@@ -142,7 +138,6 @@ impl Debug for StreamSplitExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for StreamSplitExec {
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
@@ -186,26 +181,43 @@ impl ExecutionPlan for StreamSplitExec {
     /// Stream split has two partitions:
     ///
     /// * partition 0 are the rows for which the split_expr evaluates to true
-    /// * partition 1 are the rows for which the split_expr does not evaluate to true (e.g. Null or false)
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream> {
-        trace!(partition, "SplitExec::execute");
-        self.start_if_needed().await?;
+    /// * partition 1 are the rows for which the split_expr does not evaluate to true (e.g. Null or
+    /// false)
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
+        partition: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<SendableRecordBatchStream>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            trace!(partition, "SplitExec::execute");
+            self.start_if_needed().await?;
 
-        let mut state = self.state.lock().await;
-        match &mut (*state) {
-            State::New => panic!("should have been initialized"),
-            State::Running { stream0, stream1 } => {
-                let stream = match partition {
-                    0 => stream0.take().expect("execute previously called with 0"),
-                    1 => stream1.take().expect("execute previously called with 1"),
-                    _ => panic!(
-                        "Only partition 0 or partition 1 are valid. Got {}",
-                        partition
-                    ),
-                };
-                Ok(stream)
+            let mut state = self.state.lock().await;
+            match &mut (*state) {
+                State::New => panic!("should have been initialized"),
+                State::Running { stream0, stream1 } => {
+                    let stream = match partition {
+                        0 => stream0.take().expect("execute previously called with 0"),
+                        1 => stream1.take().expect("execute previously called with 1"),
+                        _ => panic!(
+                            "Only partition 0 or partition 1 are valid. Got {}",
+                            partition
+                        ),
+                    };
+                    Ok(stream)
+                }
             }
         }
+        .boxed()
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {

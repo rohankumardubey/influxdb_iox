@@ -1,27 +1,6 @@
 //! This module contains plumbing to connect InfluxDB IOx extensions to
 //! DataFusion
 
-use async_trait::async_trait;
-use std::{convert::TryInto, fmt, sync::Arc};
-
-use arrow::record_batch::RecordBatch;
-
-use datafusion::{
-    catalog::catalog::CatalogProvider,
-    execution::context::{ExecutionContextState, QueryPlanner},
-    logical_plan::{LogicalPlan, UserDefinedLogicalNode},
-    physical_plan::{
-        coalesce_partitions::CoalescePartitionsExec,
-        displayable,
-        planner::{DefaultPhysicalPlanner, ExtensionPlanner},
-        ExecutionPlan, PhysicalPlanner, SendableRecordBatchStream,
-    },
-    prelude::*,
-};
-use futures::TryStreamExt;
-use observability_deps::tracing::{debug, trace};
-use trace::{ctx::SpanContext, span::SpanRecorder};
-
 use crate::exec::{
     fieldlist::{FieldList, IntoFieldList},
     non_null_checker::NonNullCheckerExec,
@@ -34,12 +13,28 @@ use crate::exec::{
     split::StreamSplitExec,
     stringset::{IntoStringSet, StringSetRef},
 };
-
 use crate::plan::{
     fieldlist::FieldListPlan,
     seriesset::{SeriesSetPlan, SeriesSetPlans},
     stringset::StringSetPlan,
 };
+use arrow::record_batch::RecordBatch;
+use datafusion::{
+    catalog::catalog::CatalogProvider,
+    execution::context::{ExecutionContextState, QueryPlanner},
+    logical_plan::{LogicalPlan, UserDefinedLogicalNode},
+    physical_plan::{
+        coalesce_partitions::CoalescePartitionsExec,
+        displayable,
+        planner::{DefaultPhysicalPlanner, ExtensionPlanner},
+        ExecutionPlan, PhysicalPlanner, SendableRecordBatchStream,
+    },
+    prelude::*,
+};
+use futures::{FutureExt, TryStreamExt};
+use observability_deps::tracing::{debug, trace};
+use std::{convert::TryInto, fmt, sync::Arc};
+use trace::{ctx::SpanContext, span::SpanRecorder};
 
 // Reuse DataFusion error and Result types for this module
 pub use datafusion::error::{DataFusionError as Error, Result};
@@ -58,23 +53,34 @@ pub const DEFAULT_SCHEMA: &str = "iox";
 /// and is needed to create plans with the IOx extension nodes.
 struct IOxQueryPlanner {}
 
-#[async_trait]
 impl QueryPlanner for IOxQueryPlanner {
     /// Given a `LogicalPlan` created from above, create an
     /// `ExecutionPlan` suitable for execution
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        ctx_state: &ExecutionContextState,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Teach the default physical planner how to plan SchemaPivot
-        // and StreamSplit nodes.
-        let physical_planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(IOxExtensionPlanner {})]);
-        // Delegate most work of physical planning to the default physical planner
-        physical_planner
-            .create_physical_plan(logical_plan, ctx_state)
-            .await
+    fn create_physical_plan<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        logical_plan: &'life1 LogicalPlan,
+        ctx_state: &'life2 ExecutionContextState,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<dyn ExecutionPlan>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            // Teach the default physical planner how to plan SchemaPivot
+            // and StreamSplit nodes.
+            let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+                IOxExtensionPlanner {},
+            )]);
+            // Delegate most work of physical planning to the default physical planner
+            physical_planner
+                .create_physical_plan(logical_plan, ctx_state)
+                .await
+        }
+        .boxed()
     }
 }
 

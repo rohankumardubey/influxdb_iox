@@ -1,7 +1,7 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use std::{fmt, sync::Arc};
-
+use super::adapter::SchemaAdapterStream;
+use crate::QueryChunk;
 use arrow::datatypes::SchemaRef;
 use data_types::partition_metadata::TableSummary;
 use datafusion::{
@@ -11,15 +11,11 @@ use datafusion::{
         DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
     },
 };
+use futures::FutureExt;
+use predicate::predicate::Predicate;
 use schema::selection::Selection;
 use schema::Schema;
-
-use crate::QueryChunk;
-use predicate::predicate::Predicate;
-
-use async_trait::async_trait;
-
-use super::adapter::SchemaAdapterStream;
+use std::{fmt, sync::Arc};
 
 /// Implements the DataFusion physical plan interface
 #[derive(Debug)]
@@ -54,7 +50,6 @@ impl<C: QueryChunk + 'static> IOxReadFilterNode<C> {
     }
 }
 
-#[async_trait]
 impl<C: QueryChunk + 'static> ExecutionPlan for IOxReadFilterNode<C> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -94,46 +89,59 @@ impl<C: QueryChunk + 'static> ExecutionPlan for IOxReadFilterNode<C> {
         Ok(Arc::new(new_self))
     }
 
-    async fn execute(
-        &self,
+    fn execute<'life0, 'async_trait>(
+        &'life0 self,
         partition: usize,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
-        let timer = baseline_metrics.elapsed_compute().timer();
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = datafusion::error::Result<SendableRecordBatchStream>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
+            let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+            let timer = baseline_metrics.elapsed_compute().timer();
 
-        let schema = self.schema();
-        let fields = schema.fields();
-        let selection_cols = fields.iter().map(|f| f.name() as &str).collect::<Vec<_>>();
+            let schema = self.schema();
+            let fields = schema.fields();
+            let selection_cols = fields.iter().map(|f| f.name() as &str).collect::<Vec<_>>();
 
-        let chunk = Arc::clone(&self.chunks[partition]);
+            let chunk = Arc::clone(&self.chunks[partition]);
 
-        let chunk_table_schema = chunk.schema();
+            let chunk_table_schema = chunk.schema();
 
-        // The output selection is all the columns in the schema.
-        //
-        // However, this chunk may not have all those columns. Thus we
-        // restrict the requested selection to the actual columns
-        // available, and use SchemaAdapterStream to pad the rest of
-        // the columns with NULLs if necessary
-        let selection_cols = restrict_selection(selection_cols, &chunk_table_schema);
-        let selection = Selection::Some(&selection_cols);
+            // The output selection is all the columns in the schema.
+            //
+            // However, this chunk may not have all those columns. Thus we
+            // restrict the requested selection to the actual columns
+            // available, and use SchemaAdapterStream to pad the rest of
+            // the columns with NULLs if necessary
+            let selection_cols = restrict_selection(selection_cols, &chunk_table_schema);
+            let selection = Selection::Some(&selection_cols);
 
-        let stream = chunk.read_filter(&self.predicate, selection).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Error creating scan for table {} chunk {}: {}",
-                self.table_name,
-                chunk.id(),
-                e
-            ))
-        })?;
+            let stream = chunk.read_filter(&self.predicate, selection).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Error creating scan for table {} chunk {}: {}",
+                    self.table_name,
+                    chunk.id(),
+                    e
+                ))
+            })?;
 
-        // all CPU time is now done, pass in baseline metrics to adapter
-        timer.done();
+            // all CPU time is now done, pass in baseline metrics to adapter
+            timer.done();
 
-        let adapter = SchemaAdapterStream::try_new(stream, schema, baseline_metrics)
-            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            let adapter = SchemaAdapterStream::try_new(stream, schema, baseline_metrics)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
 
-        Ok(Box::pin(adapter))
+            Ok(Box::pin(adapter) as _)
+        }
+        .boxed()
     }
 
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {

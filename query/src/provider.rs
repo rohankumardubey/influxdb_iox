@@ -1,8 +1,10 @@
 //! Implementation of a DataFusion `TableProvider` in terms of `QueryChunk`s
 
-use async_trait::async_trait;
-use std::sync::Arc;
-
+use crate::{
+    compute_sort_key,
+    util::{arrow_sort_key_exprs, df_physical_expr},
+    QueryChunk,
+};
 use arrow::{datatypes::SchemaRef as ArrowSchemaRef, error::ArrowError};
 use datafusion::{
     datasource::{datasource::TableProviderFilterPushDown, TableProvider},
@@ -18,17 +20,12 @@ use datafusion::{
         ExecutionPlan,
     },
 };
+use futures::FutureExt;
 use observability_deps::tracing::{debug, trace};
 use predicate::predicate::{Predicate, PredicateBuilder};
 use schema::{merge::SchemaMerger, sort::SortKey, Schema};
-
-use crate::{
-    compute_sort_key,
-    util::{arrow_sort_key_exprs, df_physical_expr},
-    QueryChunk,
-};
-
 use snafu::{ResultExt, Snafu};
+use std::sync::Arc;
 
 mod adapter;
 mod deduplicate;
@@ -218,7 +215,6 @@ impl<C: QueryChunk + 'static> ChunkTableProvider<C> {
     }
 }
 
-#[async_trait]
 impl<C: QueryChunk + 'static> TableProvider for ChunkTableProvider<C> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -229,13 +225,26 @@ impl<C: QueryChunk + 'static> TableProvider for ChunkTableProvider<C> {
         self.arrow_schema()
     }
 
-    async fn scan(
-        &self,
-        projection: &Option<Vec<usize>>,
+    fn scan<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        projection: &'life1 Option<Vec<usize>>,
         _batch_size: usize,
-        filters: &[Expr],
+        filters: &'life2 [datafusion::logical_plan::Expr],
         _limit: Option<usize>,
-    ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = DataFusionResult<Arc<dyn ExecutionPlan>>>
+                + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        async move {
         trace!(" = Inside ChunkTableProvider Scan");
 
         // Note that `filters` don't actually need to be evaluated in
@@ -277,6 +286,7 @@ impl<C: QueryChunk + 'static> TableProvider for ChunkTableProvider<C> {
         )?;
 
         Ok(plan)
+    }.boxed()
     }
 
     /// Filter pushdown specificiation

@@ -210,7 +210,6 @@ fn get_timestamps(metrics: &MetricsSet) -> (Option<DateTime<Utc>>, Option<DateTi
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use chrono::TimeZone;
     use datafusion::physical_plan::{
         metrics::{Count, Time, Timestamp},
@@ -429,7 +428,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl ExecutionPlan for TestExec {
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -454,10 +452,22 @@ mod tests {
             unimplemented!()
         }
 
-        async fn execute(
-            &self,
+        fn execute<'life0, 'async_trait>(
+            &'life0 self,
             _partition: usize,
-        ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream>
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = datafusion::error::Result<
+                            datafusion::physical_plan::SendableRecordBatchStream,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
         {
             unimplemented!()
         }
