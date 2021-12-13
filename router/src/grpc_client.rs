@@ -1,23 +1,25 @@
 //! gRPC clients abastraction.
 //!
 //! This abstraction was created for easier testing.
+use dml::DmlOperation;
+use futures::{future::BoxFuture, FutureExt};
+use parking_lot::RwLock;
 use std::{
     any::Any,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use async_trait::async_trait;
-use dml::DmlOperation;
-use parking_lot::RwLock;
-
 /// Generic write error.
 pub type WriteError = Box<dyn std::error::Error + Send + Sync>;
 
 /// An abstract IOx gRPC client.
-#[async_trait]
 pub trait GrpcClient: Sync + Send + std::fmt::Debug + 'static {
     /// Send DML operation to the given database.
-    async fn write(&self, db_name: &str, write: &DmlOperation) -> Result<(), WriteError>;
+    fn write<'a>(
+        &'a self,
+        db_name: &'a str,
+        write: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<(), WriteError>>;
 
     /// Cast client to [`Any`], useful for downcasting.
     fn as_any(&self) -> &dyn Any;
@@ -43,43 +45,49 @@ impl RealClient {
     }
 }
 
-#[async_trait]
 impl GrpcClient for RealClient {
-    async fn write(&self, db_name: &str, write: &DmlOperation) -> Result<(), WriteError> {
-        use influxdb_iox_client::write::generated_types::WriteRequest;
-        use mutable_batch_pb::encode::encode_write;
+    fn write<'a>(
+        &'a self,
+        db_name: &'a str,
+        write: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<(), WriteError>> {
+        async move {
+            use influxdb_iox_client::write::generated_types::WriteRequest;
+            use mutable_batch_pb::encode::encode_write;
 
-        match write {
-            DmlOperation::Write(write) => {
-                let write_request = WriteRequest {
-                    database_batch: Some(encode_write(db_name, write)),
-                };
+            match write {
+                DmlOperation::Write(write) => {
+                    let write_request = WriteRequest {
+                        database_batch: Some(encode_write(db_name, write)),
+                    };
 
-                // cheap, see https://docs.rs/tonic/0.4.2/tonic/client/index.html#concurrent-usage
-                let mut client = self.write_client.clone();
+                    // cheap, see https://docs.rs/tonic/0.4.2/tonic/client/index.html#concurrent-usage
+                    let mut client = self.write_client.clone();
 
-                client
-                    .write_pb(write_request)
-                    .await
-                    .map_err(|e| Box::new(e) as _)
-            }
-            DmlOperation::Delete(delete) => {
-                // cheap, see https://docs.rs/tonic/0.4.2/tonic/client/index.html#concurrent-usage
-                let mut client = self.delete_client.clone();
+                    client
+                        .write_pb(write_request)
+                        .await
+                        .map_err(|e| Box::new(e) as _)
+                }
+                DmlOperation::Delete(delete) => {
+                    // cheap, see https://docs.rs/tonic/0.4.2/tonic/client/index.html#concurrent-usage
+                    let mut client = self.delete_client.clone();
 
-                client
-                    .delete(
-                        db_name.to_owned(),
-                        delete
-                            .table_name()
-                            .map(|s| s.to_owned())
-                            .unwrap_or_default(),
-                        delete.predicate().clone().into(),
-                    )
-                    .await
-                    .map_err(|e| Box::new(e) as _)
+                    client
+                        .delete(
+                            db_name.to_owned(),
+                            delete
+                                .table_name()
+                                .map(|s| s.to_owned())
+                                .unwrap_or_default(),
+                            delete.predicate().clone().into(),
+                        )
+                        .await
+                        .map_err(|e| Box::new(e) as _)
+                }
             }
         }
+        .boxed()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -139,17 +147,23 @@ impl MockClient {
     }
 }
 
-#[async_trait]
 impl GrpcClient for MockClient {
-    async fn write(&self, db_name: &str, write: &DmlOperation) -> Result<(), WriteError> {
-        if self.poisoned.load(Ordering::SeqCst) {
-            return Err("poisened".to_string().into());
-        }
+    fn write<'a>(
+        &'a self,
+        db_name: &'a str,
+        write: &'a DmlOperation,
+    ) -> BoxFuture<'a, Result<(), WriteError>> {
+        async move {
+            if self.poisoned.load(Ordering::SeqCst) {
+                return Err("poisened".to_string().into());
+            }
 
-        self.writes
-            .write()
-            .push((db_name.to_string(), write.clone()));
-        Ok(())
+            self.writes
+                .write()
+                .push((db_name.to_string(), write.clone()));
+            Ok(())
+        }
+        .boxed()
     }
 
     fn as_any(&self) -> &dyn Any {

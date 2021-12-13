@@ -3472,10 +3472,10 @@ dependencies = [
 name = "router"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "cache_loader_async",
  "data_types",
  "dml",
+ "futures",
  "hashbrown",
  "influxdb_iox_client",
  "metric",
