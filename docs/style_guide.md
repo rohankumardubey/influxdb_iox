@@ -296,3 +296,61 @@ fn google_cloud() -> Result<()> {
     Ok(())
 }
 ```
+
+## Async Traits
+
+Rust does not currently allow `async fn`s to be part of a `trait`. In the past, we have used [the
+async_trait crate](https://crates.io/crates/async_trait) to allow you to write `async` trait
+functions by using a procedural macro like so:
+
+```
+#[async_trait]
+impl SomeTrait for SomeType {
+    async fn some_method(&self, arg: Type) -> ReturnType {
+        // body
+    }
+}
+```
+
+However, [due to a bug in `rustc`](https://github.com/rust-lang/rust/issues/87012), using the
+`async_trait` crate takes a lot of compilation time. To save that time, we can write out `async`
+trait functions this way instead, which doesn't need a procedural macro and doesn't run into the
+compiler issue. The equivalent code to the above example is:
+
+```
+// Need to have the `futures` crate in the crate's `Cargo.toml`
+use futures::{future::BoxFuture, FutureExt};
+
+impl SomeTrait for SomeType {
+    fn some_method(&self, arg: Type) -> BoxFuture<'_, ReturnType> {
+        async move {
+            // body
+        }.boxed()
+    }
+}
+```
+
+In words:
+
+- Add the `futures` crate as a dependency if it isn't already
+- Bring `BoxFuture` and `FutureExt` from the `futures` crate into scope if they aren't already
+- Use `fn` instead of `async fn`
+- Wrap the return type in `BoxFuture<'_, PreviousReturnType>`
+- Wrap the body of the function in an `async move {}` block
+- Call `.boxed()` on the `async move {}` block
+
+If there are borrows in the parameters of the functions that are used in the `BoxFuture`, Rust will
+tell you and you'll need to add a lifetime annotation rather than using the `'_` lifetime. Example:
+
+```
+fn write<'a>(
+    &'a self,
+    db_name: &'a DatabaseName<'_>,
+    op: DmlOperation,
+) -> BoxFuture<'a, Result<(), InnerDmlError>> {
+```
+
+If you're implementing a trait that's defined by an external crate that uses `async_trait`, you'll
+need to match what `async_trait` generates. One way to do this is to use
+[`cargo-expand`](https://github.com/dtolnay/cargo-expand) on the crate that defines the trait to
+get the code that the procedural macro generates.
