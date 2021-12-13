@@ -322,8 +322,7 @@ impl ObjectStoreApi for AmazonS3 {
         prefix: &'a Self::Path,
     ) -> BoxFuture<'a, Result<ListResult<Self::Path>, Self::Error>> {
         async move {
-            Ok(self
-                .list_objects_v2(Some(prefix), Some(DELIMITER.to_string()))
+            self.list_objects_v2(Some(prefix), Some(DELIMITER.to_string()))
                 .await?
                 .try_fold(
                     ListResult {
@@ -376,7 +375,7 @@ impl ObjectStoreApi for AmazonS3 {
                         Ok(res)
                     },
                 )
-                .await?)
+                .await
         }
         .boxed()
     }
