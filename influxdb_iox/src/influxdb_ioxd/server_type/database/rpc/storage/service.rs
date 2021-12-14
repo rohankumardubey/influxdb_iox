@@ -456,10 +456,25 @@ where
 
     async fn tag_values_grouped_by_measurement_and_tag_key(
         &self,
-        _req: tonic::Request<TagValuesGroupedByMeasurementAndTagKeyRequest>,
+        req: tonic::Request<TagValuesGroupedByMeasurementAndTagKeyRequest>,
     ) -> Result<tonic::Response<Self::TagValuesGroupedByMeasurementAndTagKeyStream>, Status> {
+        let req = req.into_inner();
+
+        let TagValuesGroupedByMeasurementAndTagKeyRequest {
+            measurement_patterns,
+            tag_key_predicate,
+            condition,
+            source,
+        } = req;
+
         Err(Error::NotYetImplemented {
-            operation: "tag_values_grouped_by_measurement_and_tag_key".to_string(),
+            operation: format!(
+                "tag_values_grouped_by_measurement_and_tag_key. Measurement patterns: {:?} tag key predicates: {:?} condition: {:?}, source: {:?}",
+                measurement_patterns,   
+                tag_key_predicate,
+                condition,
+                source,
+            ),
         }
         .to_status())
     }
