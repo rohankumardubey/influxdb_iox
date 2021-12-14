@@ -16,7 +16,8 @@ use generated_types::{
     MeasurementFieldsResponse, MeasurementNamesRequest, MeasurementTagKeysRequest,
     MeasurementTagValuesRequest, OffsetsResponse, Predicate, ReadFilterRequest, ReadGroupRequest,
     ReadResponse, ReadSeriesCardinalityRequest, ReadWindowAggregateRequest, StringValuesResponse,
-    TagKeyMetaNames, TagKeysRequest, TagValuesRequest, TimestampRange,
+    TagKeyMetaNames, TagKeysRequest, TagValuesGroupedByMeasurementAndTagKeyRequest,
+    TagValuesRequest, TagValuesResponse, TimestampRange,
 };
 use observability_deps::tracing::{error, info, trace};
 use predicate::predicate::PredicateBuilder;
@@ -448,6 +449,19 @@ where
             .expect("sending tag_values response to server");
 
         Ok(tonic::Response::new(ReceiverStream::new(rx)))
+    }
+
+    type TagValuesGroupedByMeasurementAndTagKeyStream =
+        futures::stream::Iter<std::vec::IntoIter<Result<TagValuesResponse, Status>>>;
+
+    async fn tag_values_grouped_by_measurement_and_tag_key(
+        &self,
+        _req: tonic::Request<TagValuesGroupedByMeasurementAndTagKeyRequest>,
+    ) -> Result<tonic::Response<Self::TagValuesGroupedByMeasurementAndTagKeyStream>, Status> {
+        Err(Error::NotYetImplemented {
+            operation: "tag_values_grouped_by_measurement_and_tag_key".to_string(),
+        }
+        .to_status())
     }
 
     type ReadSeriesCardinalityStream = ReceiverStream<Result<Int64ValuesResponse, Status>>;
