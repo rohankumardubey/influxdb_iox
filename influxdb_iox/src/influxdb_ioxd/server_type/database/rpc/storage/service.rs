@@ -1451,7 +1451,7 @@ mod tests {
         grpc_request_metric_has_count(&fixture, "MeasurementTagKeys", "client_error", 1);
     }
 
-    /// test the plumbing of the RPC layer for tag_keys -- specifically that
+    /// test the plumbing of the RPC layer for tag_values -- specifically that
     /// the right parameters are passed into the Database interface
     /// and that the returned values are sent back via gRPC.
     #[tokio::test]
@@ -1640,6 +1640,44 @@ mod tests {
         );
 
         grpc_request_metric_has_count(&fixture, "TagValues", "client_error", 2);
+    }
+
+    #[tokio::test]
+    async fn test_storage_rpc_tag_values_grouped_by_measurement_and_tag_key_error() {
+        test_helpers::maybe_start_logging();
+        // Start a test gRPC server on a randomally allocated port
+        let mut fixture = Fixture::new().await.expect("Connecting to test server");
+
+        let db_info = org_and_bucket();
+        let chunk = TestChunk::new("my_table");
+
+        fixture
+            .test_storage
+            .db_or_create(db_info.db_name())
+            .await
+            .unwrap()
+            .add_chunk("my_partition_key", Arc::new(chunk));
+
+        let source = Some(StorageClient::read_source(&db_info, 1));
+
+        // ---
+        // test error
+        // ---
+        let request = TagValuesGroupedByMeasurementAndTagKeyRequest {
+            source: source.clone(),
+            measurement_patterns: vec![],
+            tag_key_predicate: None,
+            condition: None,
+        };
+
+        let response_string = fixture
+            .storage_client
+            .tag_values_grouped_by_measurement_and_tag_key(request)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_contains!(response_string, "Operation not yet implemented");
     }
 
     /// test the plumbing of the RPC layer for measurement_tag_values
