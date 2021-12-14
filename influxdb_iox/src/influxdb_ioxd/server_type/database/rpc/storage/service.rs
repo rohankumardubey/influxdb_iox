@@ -470,7 +470,7 @@ where
         Err(Error::NotYetImplemented {
             operation: format!(
                 "tag_values_grouped_by_measurement_and_tag_key. Measurement patterns: {:?} tag key predicates: {:?} condition: {:?}, source: {:?}",
-                measurement_patterns,   
+                measurement_patterns,
                 tag_key_predicate,
                 condition,
                 source,
